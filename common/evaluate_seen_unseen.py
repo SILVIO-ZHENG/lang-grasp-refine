@@ -1,4 +1,11 @@
-"""Evaluate a trained method on the two released LGD test groups."""
+"""Evaluate one trained checkpoint on Seen and Unseen test instructions.
+
+Read the test groups supplied by the split directory, report them separately,
+and combine their Top-1 and Top-5 success rates with a harmonic mean.
+
+用同一个训练检查点评估 Seen 和 Unseen 两组测试指令。分别报告两组的
+结果，并计算 Top-1 与 Top-5 成功率的调和平均。
+"""
 
 import argparse
 import json
@@ -12,10 +19,24 @@ from run_experiment import GraspDataset, evaluate, load_method, overlay, read_ro
 
 
 def harmonic(seen, unseen):
+    """Combine two rates as 2xy/(x+y), with zero for two zero rates.
+
+    用 2xy/(x+y) 合并两组成功率。两个输入都为零时返回零。
+    """
     return 2 * seen * unseen / (seen + unseen) if seen + unseen else 0.0
 
 
 def load_checkpoint(method_path, run, device):
+    """Rebuild the original architecture and vocabulary before loading best.pt.
+
+    Use the run's saved vocabulary to reproduce the embedding dimensions and
+    token IDs. The three extra IDs are reserved by the training tokenizer.
+    Return the module, inference-ready model, vocabulary, and selected epoch.
+
+    加载 best.pt 前先恢复原模型结构和词表。使用训练目录中的词表还原
+    嵌入层维度及词元 ID，另加训练分词器预留的三个 ID。返回模型模块、
+    评估模式下的模型、词表和选中的训练轮次。
+    """
     method = load_method(method_path)
     vocabulary = json.loads((run / 'vocabulary.json').read_text(encoding='utf-8'))
     model = method.build(len(vocabulary) + 3).to(device)
@@ -36,6 +57,9 @@ def main():
     torch.set_num_threads(2)
     cv2.setNumThreads(0)
     report = {'best_epoch': epoch, 'protocol': 'LGD released object IDs, scene-disjoint training, ++ instructions'}
+    # Use the same checkpoint for both precomputed groups. Reuse the evaluator
+    # with prompt-switch diagnostics enabled for each group.
+    # 两组预先划好的测试集共用同一个检查点。对每组均启用指令切换诊断。
     for group in ('seen', 'unseen'):
         rows = read_rows(args.splits / f'test_{group}.jsonl')
         data = GraspDataset(rows, args.images, vocabulary)

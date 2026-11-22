@@ -1,4 +1,13 @@
-"""Inventory and split the pinned Grasp-Anything and Grasp-Anything++ corpus."""
+"""Build scene-disjoint Grasp-Anything++ splits from pinned public assets.
+
+Index annotations and object categories, cross-check instruction targets,
+seal the split plan, then write train, validation, Seen and Unseen records.
+
+从固定版本的公开数据构建按场景隔离的 Grasp-Anything++ 划分。
+
+先为标注和物体类别建索引，再核对指令目标、冻结划分计划，最后写出训练集、
+验证集、Seen 测试集和 Unseen 测试集。
+"""
 
 from __future__ import annotations
 
@@ -59,6 +68,10 @@ def normalized_label(label):
 
 
 def load_taxonomy(path):
+    """Index normalized LVIS names and synonyms, marking ambiguous aliases as -1.
+
+    为标准化的 LVIS 类别名和同义词建立索引。一个名称对应多个类别时标记为 -1。
+    """
     raw = json.loads(path.read_text(encoding="utf-8"))
     if isinstance(raw, dict):
         raw = raw.get("categories")
@@ -81,7 +94,10 @@ def load_taxonomy(path):
 
 
 def central_directory(file):
-    """Read single-volume ZIP directory bounds, including the pinned legacy locator."""
+    """Read single-volume ZIP directory bounds, including the pinned legacy locator.
+
+    读取单卷 ZIP 的目录边界，并兼容固定版本归档中的旧式定位器。
+    """
     size = file.seek(0, os.SEEK_END)
     file.seek(max(0, size - 65535 - EOCD.size))
     base, tail = file.tell(), file.read()
@@ -99,6 +115,8 @@ def central_directory(file):
         magic, locator_disk, pointer, total_disks = ZIP64_LOC.unpack(file.read(ZIP64_LOC.size))
         # The original release's Zip64 locator writes zero here. Both disks in
         # its other end records are zero, matching Python's single-volume check.
+        # 原始发行版的 Zip64 定位器在这里写入零。其他结尾记录中的磁盘编号也均为零，
+        # 与 Python 的单卷校验规则一致。
         if magic != b"PK\x06\x07" or locator_disk != 0 or total_disks not in (0, 1) or pointer + ZIP64_EOCD.size > locator_at:
             raise ValueError("Expected a bounded single-volume ZIP64 locator")
         file.seek(pointer)
@@ -114,7 +132,10 @@ def central_directory(file):
 
 
 def zip_members(path, suffix, pattern):
-    """Stream trusted single-volume ZIP directory metadata without a ZipInfo list."""
+    """Stream trusted single-volume ZIP directory metadata without a ZipInfo list.
+
+    流式读取已核验的单卷 ZIP 目录元数据，无需创建完整的 ZipInfo 列表。
+    """
     with path.open("rb", buffering=1024 * 1024) as file:
         count, start, length = central_directory(file)
         file.seek(start)
@@ -196,7 +217,10 @@ def open_work(work):
 
 
 def step(conn, name, action):
-    """Each committed index stage survives interruption. Partial stages roll back."""
+    """Each committed index stage survives interruption. Partial stages roll back.
+
+    已提交的索引阶段在中断后保留。未完成的阶段会回滚。
+    """
     with conn:
         conn.execute("BEGIN IMMEDIATE")
         if conn.execute("SELECT 1 FROM steps WHERE name=?", (name,)).fetchone():
@@ -243,6 +267,10 @@ def description_rows(path, rgb, aliases):
 
 
 def index_descriptions(conn, a, categories, aliases):
+    """Index original RGB scene IDs and map each ordered object query to LVIS.
+
+    为原版 RGB 场景 ID 建索引，并把场景中的每个物体查询按原有次序映射到 LVIS 类别。
+    """
     rgb = rgb_scene_ids(a.images)
     if len(rgb) != EXPECTED_RGB:
         raise ValueError(f"Expected {EXPECTED_RGB:,} original RGB scene filenames, found {len(rgb):,}")
@@ -263,6 +291,10 @@ def index_descriptions(conn, a, categories, aliases):
 
 
 def index_annotations(conn, table, path, suffix):
+    """Index archive offsets by (scene, object, part) without extracting payloads.
+
+    按（场景、物体、部位）记录每条标注的归档偏移，暂不解压实际内容。
+    """
     conn.execute(f"CREATE TABLE {table} (scene BLOB,obj INTEGER,part INTEGER,local INTEGER,packed INTEGER,size INTEGER,method INTEGER,crc INTEGER)")
     values = ((bytes.fromhex(match[1].decode("ascii")), int(match[2]), int(match[3]), *info)
               for match, info in zip_members(path, suffix, PART_STEM))
@@ -279,6 +311,10 @@ def index_annotations(conn, table, path, suffix):
 
 
 def index_policy(conn):
+    """Join paired target annotations and initialize Base/New by category frequency.
+
+    配对同一目标的指令和正例抓取，并按类别频次初始化 Base 和 New 类别组。
+    """
     conn.execute("""CREATE TABLE objects AS
         SELECT i.scene, i.obj, count(*) AS parts FROM instructions i INDEXED BY instructions_key
         JOIN positives p INDEXED BY positives_key USING(scene,obj,part) GROUP BY i.scene,i.obj""")
@@ -299,6 +335,10 @@ def index_policy(conn):
 
 
 def refresh_scene_policy(conn):
+    """Record all scene queries as well as paired target counts for each tier.
+
+    记录场景里全部已知查询的类别组，同时统计各类别组内带配对标注的目标数量。
+    """
     conn.execute("DROP TABLE IF EXISTS query_tiers")
     conn.execute("DROP TABLE IF EXISTS scene_policy")
     conn.execute("""CREATE TABLE query_tiers AS SELECT q.scene,
@@ -347,6 +387,10 @@ def inventory_summary(conn):
 
 
 def inventory(a):
+    """Verify source archives and build a resumable SQLite metadata index.
+
+    核验源归档，并建立可续建的 SQLite 元数据索引。
+    """
     a.work.mkdir(parents=True, exist_ok=True, mode=0o700)
     sources = source_identity(a)
     categories, aliases = load_taxonomy(a.taxonomy)
@@ -378,6 +422,10 @@ PART_CLAUSE = re.compile(r" (?:by|at|on|from|using) (?:its|their|the|a|an) ")
 
 
 def classify_instruction(prompt, aliases):
+    """Resolve the explicit object phrase through a unique alias, or return zero.
+
+    按唯一的类别别名识别指令明确提到的目标物体。无法确定时返回 0。
+    """
     clean = normalized_label(prompt)
     action = ACTION.fullmatch(clean)
     if action is None:
@@ -447,6 +495,10 @@ def refresh_prompt_scene(conn):
 
 
 def crosscheck(a):
+    """Compare instruction subjects with the original query at the same object index.
+
+    将抓取指令中的目标物体与原版场景中同一物体索引上的查询进行核对。
+    """
     with closing(open_work(a.work)) as conn:
         sources = verified_work_sources(conn)
         _, aliases = load_taxonomy(Path(sources["taxonomy"]["path"]))
@@ -492,6 +544,10 @@ def history_paths(a):
 
 
 def load_history(files):
+    """Return all prior scenes, protected scenes, and checksums of their manifests.
+
+    返回历史使用过的场景、禁止纳入任何新划分的受保护场景，以及历史清单的校验值。
+    """
     seen, protect, official = set(), set(), []
     for path, protected in sorted(files.items()):
         ids = set(history_scenes(path))
@@ -526,7 +582,16 @@ def category_assignment(conn):
 
 
 def build_membership(conn, categories, strict_train):
-    """Pack exact category-to-scene memberships and weighted training rows in bitsets."""
+    """Pack exact category-to-scene memberships and training row counts in bitsets.
+
+    Evaluation queries and confirmed targets are tracked separately so a New
+    object can exclude a scene from Base even if it has no confirmed grasp there.
+
+    用位集合保存精确的类别与场景对应关系及训练记录数量。
+
+    分开记录评测场景里出现的物体与经核实的目标。只要场景含 New 类物体，即使没有
+    对应的已核实抓取标注，该场景也不能进入 Base 组。
+    """
     train_scope = STRICT if strict_train else "rgb=1 AND invalid_description=0"
     conn.execute(f"""CREATE TEMP TABLE balance_scope AS SELECT p.scene,
         (h.scene IS NULL AND {STRICT} AND a.base_confirmed+a.new_confirmed>0) AS use_eval,
@@ -590,6 +655,15 @@ def seeded_strata(ranked, count, n_new):
 
 
 def seeded_category_search(a, ranked, membership):
+    """Pick reserved categories with seeded sampling within frequency strata.
+
+    Prefer assignments that meet the held-out scene quotas and reserve margin.
+    Among equally feasible assignments, prefer more eligible training rows.
+
+    在不同频次分层中按固定随机种子选取保留类别。
+
+    优先满足留出场景的数量与备用余量。可行性相同时，优先保留更多训练记录。
+    """
     masks, planes, (eval_n, train_n, train_rows) = membership
     n_new = len(ranked) - math.floor(0.70 * len(ranked))
     strata = seeded_strata(ranked, a.strata, n_new)
@@ -709,6 +783,10 @@ def rebalance(a):
 
 
 def plan(a):
+    """Seal quotas and source history after checking scene coverage and alignment.
+
+    核查场景数量和指令对齐状态后，冻结各划分的目标数量与历史来源。
+    """
     if min(a.val_scenes, a.seen_scenes, a.unseen_scenes) < 1:
         raise ValueError("All three holdouts require a positive scene quota")
     used, protected, files = load_history(history_paths(a))
@@ -750,6 +828,10 @@ def plan(a):
 
 
 def candidate_scenes(conn, tier, seed):
+    """Return reproducibly ordered, fresh, fully resolved held-out candidates.
+
+    返回无历史使用记录、查询已完全解析的留出候选场景，并以可复现的顺序排列。
+    """
     policy = BASE if tier == "base" else NEW
     ids = [scene for scene, in conn.execute(f"""SELECT p.scene FROM scene_policy p
         JOIN prompt_scene a USING(scene) LEFT JOIN history h USING(scene)
@@ -759,6 +841,10 @@ def candidate_scenes(conn, tier, seed):
 
 
 def training_scenes(conn, strict):
+    """Return Base scenes without prior holdouts, known New queries, or conflicts.
+
+    返回 Base 场景，排除历史留出场景、含已知 New 类物体的场景以及指令冲突场景。
+    """
     scope = STRICT if strict else "rgb=1 AND invalid_description=0"
     return [scene for scene, in conn.execute(f"""SELECT p.scene FROM scene_policy p
         JOIN prompt_scene a USING(scene) LEFT JOIN history h USING(scene)
@@ -766,6 +852,16 @@ def training_scenes(conn, strict):
 
 
 def scene_rows(conn, scene, split, images, instructions, positives, screening):
+    """Decode valid part-level instruction and grasp rows for one eligible scene.
+
+    Unseen emits confirmed New targets. The other partitions emit Base targets.
+    Only training may keep an unresolved instruction with a known Base target.
+
+    为一个符合条件的场景解码有效的部位级指令和抓取记录。
+
+    Unseen 只输出经核实的 New 目标，其余划分只输出 Base 目标。只有训练集可以保留
+    指令未能核实但目标属于已知 Base 类别的记录。
+    """
     scene_hex = scene.hex()
     image = f"{scene_hex}.jpg"
     if not image_is_available(images, image):
@@ -867,6 +963,14 @@ def decoded_candidates(split, candidates, taken, start, conn, images, instructio
 
 
 def write_partition(split, candidates, taken, goal, conn, sources, stage, state, executor=None, workers=1):
+    """Stream one JSONL partition and resume from its committed byte offset.
+
+    A scene counts toward the quota when at least one usable row is written.
+
+    流式写入一个 JSONL 划分，并从上次提交的字节偏移续写。
+
+    一个场景至少写入一条有效记录后，才计入场景配额。
+    """
     progress_file = state / f"{split}.json"
     path = stage / f"{split}.jsonl"
     progress = json.loads(progress_file.read_text(encoding="utf-8")) if progress_file.is_file() else {
@@ -938,6 +1042,16 @@ def read_sealed_plan(work):
 
 
 def materialize(a):
+    """Publish the sealed split only after all scene-disjointness checks pass.
+
+    Fill validation and both test partitions first. Training then consumes the
+    eligible remainder. The manifest records source and split checksums.
+
+    在通过各划分的场景隔离检查后，再发布冻结的划分。
+
+    先分配验证集和两个测试集，再用其余符合条件的场景构建训练集。清单记录源数据
+    和输出划分的校验值。
+    """
     workers = a.workers
     if workers < 1:
         raise ValueError("Expected at least one materialization worker")

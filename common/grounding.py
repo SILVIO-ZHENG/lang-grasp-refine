@@ -1,4 +1,12 @@
-"""Offline, prompt-only Grounding DINO localization for grasp reranking."""
+"""Locate objects and visible parts for grasp reranking with frozen Grounding DINO.
+
+Queries come from text instructions. The detector runs on the padded RGB
+image, with an optional second pass inside the highest-scoring object box.
+
+用冻结的 Grounding DINO 定位物体与可见部位，为抓取重排提供空间线索。
+查询由指令文本生成。检测器先处理补边后的 RGB 图像，可在置信度最高的物体框
+周围裁出局部图像，再检测一次指定部位。
+"""
 
 import re
 from pathlib import Path
@@ -16,6 +24,7 @@ _PART_OF_OBJECT = re.compile(r"^(.+?)\s+of\s+(.+)$")
 
 # Localizable surfaces or components. The source prompts also give non-spatial
 # hints such as material, flavor, or function, which contribute no part query.
+# 只将可定位的表面或部件转成部位查询。材质、口味或用途等描述保留物体查询即可。
 _VISIBLE_PARTS = frozenset(
     "attachments|barrel|base|binding|body|bowl|bristles|buttons|cables|camera|cap|"
     "clamping ends|clasp|clipping ends|closure|cover|earpieces|edge|eraser|face|"
@@ -26,7 +35,17 @@ _VISIBLE_PARTS = frozenset(
 
 
 def extract_phrases(prompt):
-    """Return the object phrase and an optional object-qualified part phrase."""
+    """Return the object phrase and an optional object-qualified part phrase.
+
+    Prompts follow the dataset's English templates. For example, "grasp the cup
+    by its handle" becomes "cup" for object detection and "cup handle" for the
+    full-image part query. The part list keeps parsing limited to visible terms.
+
+    返回物体短语和可选的、带物体名称的部位短语。
+    这里按数据集的英语句式解析。例如，"grasp the cup by its handle"
+    会拆成物体查询 "cup" 和全图部位查询 "cup handle"。只有词表中的
+    可见部位才会触发后者。
+    """
     text = " ".join(prompt.lower().strip(" .!?;,\t\n").split())
     text = _ARTICLE.sub("", _LEADING_ACTION.sub("", text))
 
@@ -45,7 +64,14 @@ def extract_phrases(prompt):
 
 
 def _object_crop(box, height, width):
-    """Return integer square-crop bounds, or None when zoom would be negligible."""
+    """Convert normalized corners to a padded square crop in pixel coordinates.
+
+    Use 1.2 times the longer box side, with a 32-pixel minimum. Skip a crop
+    that would cover nearly the full image. Return (left, top, side) or None.
+
+    把归一化物体框转换成带少量边距的正方形裁剪区域。边长为物体框长边的
+    1.2 倍且至少为 32 像素。接近全图时跳过放大。输出 (左, 上, 边长) 或 None。
+    """
     x1, y1, x2, y2 = box[:4] * (width, height, width, height)
     side = max(32, int(np.ceil(1.2 * max(x2 - x1, y2 - y1))))
     if side >= 0.9 * min(height, width):
@@ -56,7 +82,16 @@ def _object_crop(box, height, width):
 
 
 class Grounder:
-    """Use the official Transformers 4.57.3 processor and a local HF snapshot."""
+    """Run the Transformers 4.57.3 processor and Grounding DINO from a local snapshot.
+
+    Pass a directory with model.safetensors and the processor and tokenizer
+    configuration files. Loading is local-only and prediction uses eval and
+    inference mode, so no detector parameters are updated.
+
+    使用 Transformers 4.57.3 从本地快照加载 Grounding DINO 和处理器。
+    目录需包含 model.safetensors 及处理器和分词器配置。模型只读本地文件，
+    在评估和推理模式下运行，检测器参数保持固定。
+    """
 
     def __init__(self, model_path, device, *, batch_size=4, threshold=0.25, zoom_parts=False):
         from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
@@ -79,7 +114,17 @@ class Grounder:
 
     @torch.inference_mode()
     def predict(self, images, prompts):
-        """Return independent object and visible-part boxes in padded input coordinates."""
+        """Return per-prompt detections in normalized, padded-image coordinates.
+
+        Input images are [B, 3, H, W] in [0, 1]. Each result contains one
+        [N, 5] array per query type: (x1, y1, x2, y2, confidence). Empty arrays
+        represent missing evidence and keep the result aligned with prompts.
+
+        返回每条指令对应的检测框，坐标相对于补边后的输入图像进行归一化。
+        输入图像为取值 [0, 1] 的 [B, 3, H, W]。每个查询类型得到一个
+        [N, 5] 数组，依次为左上角、右下角和置信度。空数组表示缺少该类
+        定位线索，每张图像仍保留一项结果。
+        """
         if images.ndim != 4 or images.shape[1] != 3 or len(images) != len(prompts):
             raise ValueError("Expected B×3×H×W images and one prompt per image")
 
@@ -102,6 +147,9 @@ class Grounder:
                 requests.append((index, "part_boxes", images[index], part + "."))
                 part_requests.append((index, part.removeprefix(target + " ")))
 
+        # Batch object and full-image part requests, then route detections back
+        # to the original image index and query type.
+        # 物体查询与全图部位查询合批推理，再按原始图像索引和查询类型回填。
         for (index, kind, _, _), boxes in zip(requests, self._detect(requests), strict=True):
             results[index][kind] = boxes
         if not self.zoom_parts:
@@ -123,9 +171,13 @@ class Grounder:
             crop = images[index, :, top : top + side, left : left + side]
             # The crop already identifies the object. The bare part phrase
             # keeps the model from scoring a proposal on the object noun alone.
+            # 裁剪区域已提供物体上下文，第二次只查询部位，减少检测器因为
+            # 匹配到物体名称就给出高分的情况。
             zoom_requests.append((index, "zoom_part_boxes", crop, part + "."))
             crop_bounds.append(bounds)
 
+        # Convert crop coordinates back to the same frame used by grasp candidates.
+        # 把裁剪图坐标映射回全图归一化坐标，与抓取候选对齐。
         for (index, kind, _, _), bounds, boxes in zip(
             zoom_requests, crop_bounds, self._detect(zoom_requests), strict=True
         ):
@@ -137,6 +189,14 @@ class Grounder:
         return results
 
     def _detect(self, requests):
+        """Yield up to eight valid detections per request, sorted by confidence.
+
+        Without a target image size, the processor returns normalized corners.
+        Remove zero-area boxes and non-finite scores before taking the top eight.
+
+        逐条查询返回最多八个有效检测框，按置信度从高到低排列。处理器
+        未指定目标图像尺寸时返回归一化角点。排序前先去除零面积框和非有限分数。
+        """
         for offset in range(0, len(requests), self.batch_size):
             batch = requests[offset : offset + self.batch_size]
             inputs = self.processor(

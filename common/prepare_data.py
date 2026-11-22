@@ -3,6 +3,11 @@
 The official ++ IDs use `<scene SHA256>_<object index>_<part index>`. The RGB
 images come from the original dataset. See the official ++ dataset README and
 LGD's `utils/dataset_processing/grasp.py` for the source formats.
+
+将 Grasp-Anything 的 RGB 图像与 Grasp-Anything++ 的抓取指令和矩形标注配对。
+
+官方 ++ ID 由 `<场景 SHA256>_<物体索引>_<部位索引>` 组成。RGB 图像来自原版
+数据集。源数据格式见官方 ++ 数据集说明和 LGD 的 `utils/dataset_processing/grasp.py`。
 """
 
 from __future__ import annotations
@@ -34,6 +39,11 @@ MIB = 1024**2
 
 
 class PrimitivePickle(pickle.Unpickler):
+    """Decode primitive annotation data with class and external lookups disabled.
+
+    读取基础类型标注数据，禁用类解析和外部持久化引用。
+    """
+
     def find_class(self, module, name):
         raise pickle.UnpicklingError(f"Global {module}.{name} is not permitted in an instruction")
 
@@ -42,6 +52,10 @@ class PrimitivePickle(pickle.Unpickler):
 
 
 def clean_instruction(payload: bytes) -> str:
+    """Decode an official instruction string and normalize its whitespace.
+
+    解码官方指令字符串，并统一空白字符。
+    """
     obj = PrimitivePickle(io.BytesIO(payload)).load()
     if not isinstance(obj, str):
         raise ValueError(f"Expected official Grasp-Anything++ instruction string, got {type(obj).__name__}")
@@ -63,6 +77,7 @@ class DirectorySource:
         self.root, self.max_size = root, max_size
         self.records = {}
         # Official archive components are flat; allow an enclosing directory.
+        # 官方归档组件是平铺的，同时兼容外面多包一层目录的情况。
         for directory, children, files in os.walk(root, followlinks=False):
             children[:] = [d for d in children if d not in {"__MACOSX", ".git"}]
             for name in files:
@@ -109,6 +124,11 @@ class PrefixZipSource:
     download. The file may continue to grow; indexing uses one length snapshot
     and reading verifies the member's advertised length and CRC32. This does
     not substitute for verifying the completed archive against its official hash.
+
+    为官方 ZIP 连续前缀中已完整下载的成员建立索引。
+
+    这样可在完整下载前生成明确标注的试验划分。索引使用文件长度快照，读取时校验
+    成员的声明长度和 CRC32。完整归档仍须按官方哈希单独核验。
     """
 
     def __init__(self, file: Path, suffix: str, max_size: int, stack: ExitStack):
@@ -189,9 +209,20 @@ def open_archive_source(file: Path, suffix: str, limit: int, stack: ExitStack, a
 
 
 def load_grasps(payload: bytes, side: int, limit: int) -> list[list[float]]:
+    """Convert official N-by-6 tensors into validated five-value rectangles.
+
+    Keep center and size in image pixels and wrap angles in radians modulo pi.
+    A zero limit keeps every valid rectangle.
+
+    将官方 N×6 张量转换成经过检查的五参数抓取矩形。
+
+    中心和尺寸保留像素单位，角度转换为弧度并按半周取模。`limit=0` 时保留所有
+    有效矩形。
+    """
     import torch
 
     # Modern Torch archives plus weights_only avoids arbitrary object loading.
+    # 只读取现代 Torch 归档，并启用 weights_only，避免加载任意对象。
     if not payload.startswith(b"PK\x03\x04"):
         raise ValueError("Expected a modern ZIP-based tensor archive")
     labels = torch.load(io.BytesIO(payload), map_location="cpu", weights_only=True)
@@ -215,6 +246,10 @@ def stable_hash(scene: str, seed: int, salt: str) -> int:
 
 
 def split_name(scene: str, seed: int) -> str:
+    """Assign all rows of one scene to the same 80/10/10 hash bucket.
+
+    按场景哈希以 80/10/10 的比例分桶。同一场景的全部记录进入同一划分。
+    """
     block = stable_hash(scene, seed, "split") % 100
     return "train" if block < 80 else "val" if block < 90 else "test"
 
@@ -247,6 +282,10 @@ def describe_source(source, path):
 
 
 def load_pilot_receipt(instructions: Path, positives: Path):
+    """If present beside both archives, verify the pilot receipt and local hashes.
+
+    如果两个归档的同一目录中有试验采样记录，核验其来源及两个本地归档的哈希。
+    """
     if instructions.parent.resolve() != positives.parent.resolve():
         return None
     receipt_path = instructions.parent / "range_pilot_receipt.json"
@@ -267,6 +306,16 @@ def load_pilot_receipt(instructions: Path, positives: Path):
 
 
 def prepare(a):
+    """Write scene-disjoint splits from extracted annotations or paired ZIP files.
+
+    Keep targets that have both an instruction and valid rectangles, and require
+    the original RGB image for each retained scene. Output JSONL and a manifest.
+
+    从已解压的标注或配对 ZIP 文件生成按场景隔离的训练、验证和测试划分。
+
+    只保留同时拥有指令与有效矩形的目标，每个保留场景还需有原版 RGB 图像。
+    输出 JSONL 与数据清单。
+    """
     if not a.images.is_dir() or a.out.exists():
         raise ValueError("The image directory must exist and output must be a new directory")
     a.out.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -300,6 +349,9 @@ def prepare(a):
             tally["matched_scenes"] = len(by_scene)
             sinks = {k: stack.enter_context((scratch / f"{k}.jsonl").open("w", encoding="utf-8"))
                      for k in ("train", "val", "test")}
+            # Separate the sampling hash from the split hash so limiting scenes
+            # does not select by the order used for train/validation assignment.
+            # 分开使用抽样哈希和划分哈希，限制场景数量时不依赖训练与验证的分桶顺序。
             seq = sorted(by_scene, key=lambda s: stable_hash(s, a.seed, "selection"))
             for scene in seq:
                 if a.max_scenes and sum(scenes_per_split.values()) == a.max_scenes:

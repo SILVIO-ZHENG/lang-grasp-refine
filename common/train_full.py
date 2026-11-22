@@ -1,4 +1,8 @@
 """Train a grasp candidate model on a scene-disjoint indexed JSONL dataset."""
+# Index each split by byte offset, train on scene-disjoint records, and
+# maintain separate checkpoints for evaluation and for continuation.
+# 按字节偏移为各数据划分建立索引，在场景互斥的数据集上训练，
+# 分别保存用于评估和用于断点恢复的检查点。
 
 import argparse
 from array import array
@@ -53,7 +57,14 @@ def arguments():
 
 @contextmanager
 def run_lock(path):
-    """Prevent concurrent resume processes from overwriting each other's state."""
+    """Acquire an exclusive lock before changing files in a run directory.
+
+    The lock fails immediately if a second process already owns the run.
+    Closing the file releases the lock on Windows and POSIX.
+
+    修改训练目录前先获取独占锁。若已有另一个进程在使用该目录，立即退出。
+    Windows 与 POSIX 下都在文件关闭时释放锁。
+    """
     with path.open("a+b") as handle:
         if os.name == "nt":
             import msvcrt
@@ -68,12 +79,27 @@ def run_lock(path):
 
 
 def source_info(path):
+    """Record a source's resolved path, byte count, and modification time.
+
+    记录数据源的绝对路径、字节数和修改时间。
+    """
     stat = path.stat()
     return {"path": str(path.resolve()), "bytes": stat.st_size, "mtime_ns": stat.st_mtime_ns}
 
 
 def build_indexes(args):
-    """Store one file offset per row and compute the vocabulary from training only."""
+    """Index JSONL byte ranges and compute the vocabulary from training prompts.
+
+    Each offset file stores one uint64 per record plus a final end-of-file
+    offset. Build the holdout indexes before training to check that no scene
+    crosses a split. For an existing manifest, validate source metadata and
+    index lengths before reusing the saved vocabulary and indexes.
+
+    按 JSONL 字节范围建立索引，词表只从训练指令统计。每条记录存一个
+    uint64 起始偏移，并在末尾存文件结束位置。先索引留出集，再处理训练集，
+    用于检查场景是否跨划分重复。已有索引时，先核对数据源元信息和索引长度，
+    再使用保存的词表及索引。
+    """
     root = args.output / "indexes"
     root.mkdir(exist_ok=True)
     manifest = root / "manifest.json"
@@ -109,6 +135,10 @@ def build_indexes(args):
                     continue
                 row = json.loads(line)
                 scene = row["scene_id"]
+                # Add a split's scenes only after reading that whole split,
+                # so multiple instructions in one scene remain legal.
+                # 读完整个划分后才把它的场景加入集合，同一划分中的
+                # 同一场景仍可以有多条指令。
                 if scene in holdout_scenes:
                     raise ValueError(f"Shared scene detected in {name}: {scene}")
                 if name == "train":
@@ -135,6 +165,17 @@ def build_indexes(args):
 
 
 class IndexedDataset(Dataset):
+    """Read one indexed instruction per sample without loading the full JSONL.
+
+    The fixed-size outputs used for loss are RGB, prompt tokens, padded grasp
+    rectangles, and a validity mask. Evaluation additionally returns all
+    rectangles and identifiers for metrics and prediction files.
+
+    每次按索引读取一条指令。损失计算使用定长的 RGB 图、指令词元、
+    补齐后的抓取矩形和有效掩码。评估时额外返回完整矩形及样本标识，
+    用于指标统计和预测文件。
+    """
+
     def __init__(self, source, offsets, rows, images, vocabulary, *, train=False, seed=121):
         self.source = source
         self.offsets = offsets
@@ -149,9 +190,17 @@ class IndexedDataset(Dataset):
         return self.rows
 
     def __getstate__(self):
+        """Reopen the file mappings in each worker after dataset serialization.
+
+        数据集序列化后，由各数据加载进程自行打开文件映射。
+        """
         return dict(vars(self), _data=None, _starts=None)
 
     def __getitem__(self, index):
+        """Read one sample and use (epoch, index) to seed its training flip.
+
+        根据索引读取单条样本。训练时由轮次和行号共同决定是否翻转。
+        """
         epoch, index = index if self.train else (0, index)
         if self._data is None:
             with self.source.open("rb") as source:
@@ -161,6 +210,8 @@ class IndexedDataset(Dataset):
         with Image.open(self.images / row["image"]) as source:
             rgb = source.convert("RGB")
         width, height = rgb.size
+        # Match the annotations to the centered square before resizing.
+        # 补成正方形时同步变换标注，使抓取框与缩放后的图像保持对齐。
         boxes = normalized(row["grasps"], width, height)
         if width != height:
             side = max(width, height)
@@ -169,6 +220,10 @@ class IndexedDataset(Dataset):
             rgb = square
         rgb = rgb.resize((SIZE, SIZE), Image.Resampling.BILINEAR)
         if self.train and not DIRECTION.search(row["prompt"]):
+            # The same row and epoch use the same flip after interruption,
+            # regardless of worker assignment or prefetch order.
+            # 每条记录在同一轮的翻转结果可复现，不受恢复后的加载进程分配
+            # 和预取顺序影响。
             key = f"{self.seed}:{epoch}:{index}".encode("ascii")
             if hashlib.blake2b(key, digest_size=1).digest()[0] < 128:
                 rgb = ImageOps.mirror(rgb)
@@ -187,7 +242,14 @@ class IndexedDataset(Dataset):
 
 
 class LocalitySampler(Sampler):
-    """Shuffle both row blocks and rows within each block with bounded memory."""
+    """Shuffle blocks and their rows without allocating a full-data permutation.
+
+    The epoch seed determines both permutations. After loading a checkpoint,
+    regenerate that epoch's order and skip the number of processed examples.
+
+    分别打乱块顺序与块内记录，无需为全量记录生成一个置换表。
+    两级顺序均由轮次种子决定。恢复时重建同一轮的顺序，再跳过已处理的样本。
+    """
 
     def __init__(self, length, block_size, seed):
         self.length, self.block_size, self.seed = length, block_size, seed
@@ -210,12 +272,26 @@ class LocalitySampler(Sampler):
 
 
 def collate_eval(batch):
+    """Batch fixed-shape tensors while keeping full annotations per sample.
+
+    只对定长张量组成批次。完整标注数量可变，仍按样本分别保留。
+    """
     values, truth, metadata = zip(*batch, strict=True)
     return default_collate(values), truth, metadata
 
 
 @torch.inference_mode()
 def evaluate(method, net, loader, device, predictions=None):
+    """Evaluate decoded grasps against every annotation for each instruction.
+
+    Compute loss using the padded target tensors. For Top-1 and Top-5, use the
+    full annotation lists and require both strict IoU and angle thresholds.
+    Stream optional JSONL predictions to a temporary file until the split ends.
+
+    每条指令的解码结果都与其完整标注比对。损失使用补齐后的标注张量，
+    Top-1 与 Top-5 使用完整标注，且严格检查 IoU 和角度阈值。需要导出时，
+    先逐行写入临时 JSONL，评估完该划分后再替换目标文件。
+    """
     net.eval()
     count = top1 = top5 = 0
     total_loss = infer_seconds = 0.0
@@ -249,18 +325,30 @@ def evaluate(method, net, loader, device, predictions=None):
 
 
 def save_checkpoint(path, payload):
+    """Write a complete checkpoint beside its destination before replacement.
+
+    在目标目录先写完整的临时检查点，再替换正式文件。
+    """
     temp = path.with_suffix(".tmp")
     torch.save(payload, temp)
     temp.replace(path)
 
 
 def rng_state(device):
+    """Capture Python, NumPy, Torch CPU, and selected CUDA random state.
+
+    保存 Python、NumPy、Torch CPU 和当前 CUDA 设备的随机数状态。
+    """
     name, keys, position, has_gaussian, gaussian = np.random.get_state()
     return {"python": random.getstate(), "numpy": (name, keys.tolist(), position, has_gaussian, gaussian),
             "torch": torch.get_rng_state(), "cuda": torch.cuda.get_rng_state(device) if device.type == "cuda" else None}
 
 
 def restore_rng(state, device):
+    """Restore random generators from the training continuation checkpoint.
+
+    使用断点检查点中保存的数据还原随机数生成器状态。
+    """
     random.setstate(state["python"])
     name, keys, position, has_gaussian, gaussian = state["numpy"]
     np.random.set_state((name, np.asarray(keys, dtype=np.uint32), position, has_gaussian, gaussian))
@@ -270,6 +358,16 @@ def restore_rng(state, device):
 
 
 def fit(args, method, model, loaders, sampler, device, training_signature):
+    """Train with validation-based selection and resume at a saved batch boundary.
+
+    last.pt stores the model, optimizer, scheduler, random state, signature, and
+    progress. best.pt stores the validation winner and its selection metadata.
+    Only resume a last.pt whose training signature matches the requested run.
+
+    训练时在验证集选择权重，并允许从已保存的批次边界继续。last.pt 保存
+    模型、优化器、学习率调度器、随机状态、配置签名和进度。
+    best.pt 保存验证集最佳权重及选取信息。恢复时要求配置签名与断点一致。
+    """
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.02)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=0.08 * args.lr)
     best_path = args.output / "best.pt"
@@ -303,6 +401,10 @@ def fit(args, method, model, loaders, sampler, device, training_signature):
             break
         model.train()
         sampler.epoch = epoch
+        # Count completed examples, including a potentially shorter last batch.
+        # This cursor ignores examples merely prefetched by a worker.
+        # 按已完成训练的样本计数，覆盖长度较短的末批。加载进程预取但尚未
+        # 参与更新的样本不计入恢复位置。
         sampler.skip = state["examples"]
         for values in loaders["train"]:
             image, tokens, targets, valid = (tensor.to(device, non_blocking=device.type == "cuda") for tensor in values)
@@ -327,6 +429,10 @@ def fit(args, method, model, loaders, sampler, device, training_signature):
         record = {"epoch": epoch, "train_loss": state["loss_sum"] / state["examples"], "validation": validation,
                   "elapsed_s": elapsed + time.perf_counter() - start, "optimizer_steps": state["steps"]}
         state["history"].append(record)
+        # Highest validation Top-1 wins. Break ties with higher Top-5, then
+        # lower loss. Update the scheduler and continuation state each epoch.
+        # 首先按验证集 Top-1 选权重，若相同则依次比较更高的 Top-5 和
+        # 更低的损失。每轮结束后更新学习率调度器并保存恢复状态。
         score = validation["top1"], validation["top5"], -validation["loss"]
         if score > state["best"]:
             state["best"], state["stale"] = score, 0
@@ -352,6 +458,10 @@ def main():
 
 
 def train(args):
+    """Prepare the indexed splits, fit the chosen model, and test its best weights.
+
+    准备已索引的数据划分，训练选定模型，并使用验证集选出的权重评估测试集。
+    """
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -373,6 +483,10 @@ def train(args):
                                    collate_fn=None if training else collate_eval, num_workers=args.workers,
                                    pin_memory=device.type == "cuda", persistent_workers=training and args.workers > 0,
                                    generator=torch.Generator().manual_seed(args.seed))
+    # Resume is tied to run settings, exact model file bytes, and indexed
+    # split digests. A changed model file requires a new training run.
+    # 断点恢复会检查训练参数、模型源文件字节和划分摘要。源文件发生
+    # 变化时，需创建新的训练任务。
     signature = {key: getattr(args, key) for key in ("epochs", "batch", "seed", "lr", "shuffle_block", "patience", "device")}
     signature.update(method=str(args.method.resolve()), method_sha256=hashlib.sha256(args.method.read_bytes()).hexdigest(),
                      images=str(args.images.resolve()), data={name: info["sha256"] for name, info in index.items()})
@@ -390,6 +504,8 @@ def train(args):
     method = load_method(args.method)
     model = method.build(len(vocabulary) + 3).to(device)
     state = fit(args, method, model, loaders, sampler, device, signature)
+    # Evaluate the validated winner on both held-out groups.
+    # 在两个留出测试组上评估同一份验证集最佳权重。
     best = torch.load(args.output / "best.pt", map_location="cpu", weights_only=True)
     model.load_state_dict(best["model"])
     test = {}

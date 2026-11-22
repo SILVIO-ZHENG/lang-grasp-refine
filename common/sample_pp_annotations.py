@@ -3,6 +3,12 @@
 Downloads a byte-contiguous prefix of each archive, checks response bounds and
 each selected member's ZIP CRC, then repacks only matched target IDs. The pilot
 receipt deliberately distinguishes this from full archive SHA-256 verification.
+
+从固定版本的官方 ZIP 文件中抽取可复现的小规模标注样本。
+
+下载各归档开头连续的字节范围，校验返回范围和所选成员的 ZIP CRC，然后只打包
+指令与正例标注都齐全的目标。采样记录注明部分归档的核验范围，完整归档需要
+单独进行 SHA-256 核验。
 """
 
 from __future__ import annotations
@@ -46,6 +52,10 @@ def official_url(endpoint, name):
 
 
 def read_chunk(endpoint, name, start, stop, chunk):
+    """Read one pinned HTTP byte range and publish it after checking its bounds.
+
+    读取固定版本归档的一个 HTTP 字节范围，检查返回边界和实际长度后再保存。
+    """
     size = stop - start
     if chunk.is_file() and chunk.stat().st_size == size:
         return chunk
@@ -87,6 +97,16 @@ def manifest_for(path):
 
 
 def select_targets(instructions, positives, excluded, paired_only, max_scenes, seed):
+    """Sample scenes containing targets present in both annotation sources.
+
+    Exclude every scene in the supplied history. In paired mode, require at
+    least two object IDs and two distinct instruction texts in a scene.
+
+    从两份标注都含有可匹配目标的场景中抽样。
+
+    排除历史列表中的所有场景。开启配对模式时，每个场景至少包含两个不同的
+    物体 ID 及两条不同的指令文本。
+    """
     by_scene = {}
     for target in instructions.records.keys() & positives.records.keys():
         scene, object_id, _ = ID_PATTERN.fullmatch(target).groups()
@@ -109,6 +129,15 @@ def select_targets(instructions, positives, excluded, paired_only, max_scenes, s
 
 
 def sample(a):
+    """Repack selected instruction and grasp records into matched pilot ZIPs.
+
+    The receipt stores the source revision, sampling seed, excluded scenes,
+    and checksums of the newly written archives.
+
+    把选中的指令和抓取标注重新打包为相互匹配的试验 ZIP 文件。
+
+    采样记录保存源版本、随机种子、排除场景的数量和输出归档的校验值。
+    """
     if a.out.exists():
         raise ValueError("Pilot output directory must not already exist")
     a.work.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -133,6 +162,9 @@ def sample(a):
             if downloaded % (16 * MIB) == 0 or downloaded == sum(want.values()):
                 print(f"Official prefix ranges available: {downloaded / MIB:.0f} MiB", flush=True)
     prefixes = {}
+    # Range requests finish out of order. Concatenate by byte offset so the
+    # prefix can be parsed as consecutive ZIP local members.
+    # 并发范围请求的完成顺序可能不同。按字节偏移依次拼接，才能连续解析 ZIP 本地成员。
     for name, file_list in parts.items():
         prefix = a.work / (name + ".prefix")
         with prefix.open("wb") as sink:

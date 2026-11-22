@@ -1,4 +1,14 @@
-"""Join the author-released LGD object lists with pinned official ++ annotations."""
+"""Join the author-released LGD object lists with pinned official ++ annotations.
+
+Use the published Seen and Unseen object IDs for evaluation. Report coverage
+and missing objects when the public RGB and annotation files cannot supply all
+of those targets.
+
+把 LGD 作者发布的物体列表与固定版本的官方 Grasp-Anything++ 标注配对。
+
+评测沿用作者发布的 Seen 和 Unseen 物体 ID。公开图像或标注缺失时，在清单中
+记录覆盖范围和缺失的物体。
+"""
 
 from __future__ import annotations
 
@@ -44,6 +54,10 @@ DIRECTORY_HEADER = struct.Struct("<4s6H3I5H2I")
 
 
 def official_objects(root):
+    """Verify the author's object-list hashes, expected counts, and disjoint IDs.
+
+    校验作者发布的物体列表哈希、预期数量，并确认各列表的物体 ID 互不重叠。
+    """
     sets = {}
     for split, (rel, count, expected_sha) in AUTHOR_LISTS.items():
         data = (root / rel).read_bytes()
@@ -66,6 +80,16 @@ def scene_id(object_id):
 
 
 def scene_partitions(official, seed):
+    """Preserve the published test membership and separate the remaining scenes.
+
+    Remove training objects whose scenes appear in either test split. Select
+    validation scenes by seeded hash and assign the remaining objects to train.
+
+    保留作者发布的测试物体归属，再对其余场景划分训练和验证。
+
+    训练列表里出现在任一测试场景中的物体会被剔除。按带种子的哈希选出验证场景，
+    其余物体划入训练集。
+    """
     seen_scenes = {scene_id(key) for key in official["test_seen"]}
     unseen_scenes = {scene_id(key) for key in official["test_unseen"]}
     if seen_scenes & unseen_scenes:
@@ -110,7 +134,10 @@ def central_directory(stream):
 
 
 class SelectedZipSource(PrefixZipSource):
-    """Index only author-listed object IDs to avoid materializing millions of entries."""
+    """Index ZIP records only for object IDs in the selected author lists.
+
+    只为选定作者列表中的物体建立 ZIP 成员索引，无需在内存中保存全部标注记录。
+    """
 
     def __init__(self, file, suffix, limit, wanted, stack):
         self.file = stack.enter_context(file.open("rb", buffering=1024 * 1024))
@@ -155,6 +182,10 @@ class SelectedZipSource(PrefixZipSource):
 
 
 def annotation_sources(a):
+    """Check full archives against pinned hashes or require a partial-pilot receipt.
+
+    完整归档按固定哈希核验。使用部分归档试验时，则要求提供匹配的采样记录。
+    """
     paths = {"grasp_instructions.zip": a.instructions_zip, "grasp_label_positive.zip": a.positive_zip}
     if a.allow_partial:
         receipt = load_pilot_receipt(a.instructions_zip, a.positive_zip)
@@ -183,6 +214,16 @@ def image_is_available(images, name):
 
 
 def official_rows(a, instructions, positives, object_to_split):
+    """Join usable RGB, instructions, and positive grasp targets by part ID.
+
+    Return rows and recovered object IDs per partition, plus screening reasons
+    for missing or invalid inputs. Check that the resulting scenes are disjoint.
+
+    按部位 ID 配对可用的 RGB 图像、抓取指令与正例抓取标注。
+
+    返回各划分中的记录、成功配对的物体 ID 和输入缺失或无效的原因，并检查各划分
+    之间没有场景交叉。
+    """
     by_scene = defaultdict(list)
     image_status = {}
     reasons = {part: defaultdict(set) for part in PARTITIONS}
@@ -235,6 +276,10 @@ def write_rows(path, rows):
 
 
 def build(a):
+    """Write four split manifests, a combined test file, and a coverage audit.
+
+    写出四个划分的 JSONL、合并的测试文件，以及标注覆盖率核查结果。
+    """
     if not a.images.is_dir() or a.out.exists():
         raise ValueError("The RGB directory must exist and the output directory must be new")
     official = official_objects(a.author_splits)

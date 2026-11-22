@@ -5,6 +5,18 @@ Given an RGB image and a text instruction such as "grasp the mug by its handle,"
 - **Geometric refinement.** A text-conditioned heatmap proposes 24 rectangles. Grounding DINO supplies object and part support. A small MLP uses that support and the pixels near each candidate to adjust its center, size, and angle.
 - **Dual-contact proposals with learned ranking.** A second model predicts a pair of gripper contact points, which gives 24 additional candidates after conversion to rectangles. A learned ranker adjusts the refined heatmap scores. The two branches then compete in a shared ranking.
 
+## Source layout
+
+| Path | Responsibility |
+|---|---|
+| [geometry_refinement/](geometry_refinement/) | FiLM heatmap proposer and the five-parameter grasp correction |
+| [dual_contact_ranking/](dual_contact_ranking/) | Language-gated contact CNN, endpoint decoding, and ranking across the two branches |
+| [common/](common/) | Split preparation, backbone training, frozen grounding, candidate features, and supervised refiner/ranker training |
+| [12_full_scale/](12_full_scale/) | Shared reproduction commands for caching, fitting, and evaluating the paper methods |
+| [analysis/](analysis/) | Audit saved evaluation shards and trace the qualitative examples used to explain the two methods |
+
+几何细化和双接触点排序各有独立的方案目录。两篇共用的定位、监督训练和评测代码集中维护。源码注释先写英文，再写中文。
+
 ## Reported evaluation
 
 | Method | Seen Top-1 | Unseen Top-1 | Top-1 H | Top-5 H |
@@ -14,6 +26,8 @@ Given an RGB image and a text instruction such as "grasp the mug by its handle,"
 | Dual contacts and learned ranking | 70.20 | 54.01 | 61.054 | 82.72 |
 
 Values are percentages. H is the harmonic mean of Seen and Unseen. A prediction counts as correct when its rotated IoU is greater than 0.25 and its angle error is less than 30 degrees for at least one annotated grasp matched to the instruction. The reported run uses a project-specific scene-disjoint split, with 40,000 scenes in each test group. [Reported results](reported_results.json) records the instruction counts, split checksums, and aggregate metrics.
+
+Geometry refinement has 146,035 correct first predictions out of 208,116 Seen instructions, and 65,614 out of 122,788 Unseen instructions. These counts describe 2D agreement with the dataset annotations.
 
 ## Run the experiments
 
@@ -50,10 +64,10 @@ The reported benchmark also excluded scenes used in earlier experiments. A fresh
 ### Train, ground, and score
 
 ~~~sh
-python common/train_full.py --method 01_film_dense/model.py --images data/images \
-  --splits data/splits --output 01_film_dense/full_v1 --skip-test
-python common/train_full.py --method 08_contact_pairs/model.py --images data/images \
-  --splits data/splits --output 08_contact_pairs/full_v1 --skip-test
+python common/train_full.py --method geometry_refinement/model.py --images data/images \
+  --splits data/splits --output geometry_refinement/full_v1 --skip-test
+python common/train_full.py --method dual_contact_ranking/model.py --images data/images \
+  --splits data/splits --output dual_contact_ranking/full_v1 --skip-test
 
 python 12_full_scale/panels.py prepare --splits data/splits --output work/panels \
   --all-train --val-count 8192 --shard-size 2048
@@ -68,6 +82,22 @@ python 12_full_scale/run_2d.py summarize --panels work/panels --fit work/fit \
 ~~~
 
 The cache and evaluation stages accept --workers N with one job for each --worker index from 0 to N-1. Keep their input manifests fixed when resuming. Candidate heads are fitted on the training split and selected on validation. Test images and grasp annotations are used to measure results after model selection.
+
+### Check saved results and replay examples
+
+~~~sh
+python analysis/collect_paired_counts.py --panels work/panels --evaluation work/evaluation
+python analysis/collect_visual_examples.py --root . --tag full_v1 \
+  --panels work/panels --cache work/cache --fit work/fit \
+  --evaluation work/evaluation --images data/images > work/traced_examples.json
+python -m pip install "matplotlib>=3.7"
+python analysis/render_visual_examples.py --trace work/traced_examples.json \
+  --images data/images --output work/qualitative
+~~~
+
+The audit checks shard fingerprints and recounts Top-1 and paired changes from the saved predictions. Top-5 and pool coverage come from the evaluation receipts. The replay command uses the frozen checkpoints to verify that a geometry example preserves the original candidate index, or that a dual-contact example picks a new contact proposal. The optional renderer uses Matplotlib and Pillow to draw the center heatmap and before/after rectangles on matching crops.
+
+For saved checkpoints and fit receipts from an earlier layout, pass the original run root to the evaluation and replay commands. Keep its original model source, checkpoints, and vocabulary together so the recorded hashes still match. Resume training in the original checkout if its receipt pins the original source path.
 
 ## Sources
 
