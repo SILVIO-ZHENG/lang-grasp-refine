@@ -1,0 +1,6 @@
+{
+  "upstream": "https://raw.githubusercontent.com/facebookresearch/detectron2/247691a1c292654867deb35cabb27f18d75a1363/detectron2/data/datasets/lvis_v1_categories.py",
+  "revision": "247691a1c292654867deb35cabb27f18d75a1363",
+  "source_sha256": "2fd8d25a76e465710bb87af0f9d7591ff3292e2eeb14bf921a6277c4fe67fc6a",
+  "count": 1203
+}

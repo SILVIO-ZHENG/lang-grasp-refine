@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.env.*
+.cache/
+data/
+work/
+**/full_v1/
+*.pt
+*.pth
+*.safetensors
+*.ckpt
+*.log

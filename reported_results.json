@@ -1,0 +1,143 @@
+{
+  "evaluation": "rotated IoU > 0.25 and angle modulo pi < 30 degrees, per instruction",
+  "scene_counts": {
+    "val": 40000,
+    "test_seen": 40000,
+    "test_unseen": 40000,
+    "train": 483581
+  },
+  "instruction_counts": {
+    "val": 208601,
+    "test_seen": 208116,
+    "test_unseen": 122788,
+    "train": 2152445
+  },
+  "reported_split_sha256": {
+    "val": "e8ef1d9a1d1071f04905698ea070db8c33b0a6d0febf5dbe728804d957dee3d4",
+    "test_seen": "1219335b07384da963706057b5f62b72bd751552edf42fb97e478047edae72ba",
+    "test_unseen": "a9e922f060fd2b59a82b9dc10531fd3dfab808be70d06bdb29fd47594753377c",
+    "train": "821207cce25edcb06f7f4ad5eb7cc3f94c0486e08cb82b6b12aaaeea84ae2264"
+  },
+  "split_seed": 20261121,
+  "validation_settings": {
+    "grounded_zoom": {
+      "weights": [
+        8.0,
+        0.5
+      ],
+      "val": {
+        "n": 8192,
+        "top1_successes": 5444,
+        "top5_successes": 6892,
+        "oracle_successes": 7640,
+        "top1": 0.66455078125,
+        "top5": 0.84130859375,
+        "oracle_pool": 0.9326171875
+      }
+    },
+    "geometry_refinement": {
+      "weights": [
+        1.6,
+        1.0
+      ],
+      "val": {
+        "n": 8192,
+        "top1_successes": 5770,
+        "top5_successes": 6989,
+        "oracle_successes": 7652,
+        "top1": 0.704345703125,
+        "top5": 0.8531494140625,
+        "oracle_pool": 0.93408203125
+      }
+    },
+    "refined_heatmap_contact": {
+      "weights": [
+        0.8,
+        -3.5
+      ],
+      "val": {
+        "n": 8192,
+        "top1_successes": 5770,
+        "top5_successes": 6933,
+        "oracle_successes": 7750,
+        "top1": 0.704345703125,
+        "top5": 0.8463134765625,
+        "oracle_pool": 0.946044921875
+      }
+    }
+  },
+  "offline_2d": {
+    "grounded_zoom": {
+      "test_seen": {
+        "n": 208116,
+        "top1_successes": 138032,
+        "top5_successes": 175590,
+        "oracle_successes": 193357,
+        "top1": 0.663245497703204,
+        "top5": 0.8437121605258606,
+        "oracle_pool": 0.9290828191969863,
+        "scenes": 40000
+      },
+      "test_unseen": {
+        "n": 122788,
+        "top1_successes": 60392,
+        "top5_successes": 99275,
+        "oracle_successes": 110932,
+        "top1": 0.49183959344561357,
+        "top5": 0.8085073459947226,
+        "oracle_pool": 0.9034433332247451,
+        "scenes": 40000
+      },
+      "h_top1": 0.5648248747121082,
+      "h_top5": 0.8257346883971542
+    },
+    "geometry_refinement": {
+      "test_seen": {
+        "n": 208116,
+        "top1_successes": 146035,
+        "top5_successes": 177344,
+        "oracle_successes": 193786,
+        "top1": 0.7017000134540352,
+        "top5": 0.8521401526071999,
+        "oracle_pool": 0.9311441695977244,
+        "scenes": 40000
+      },
+      "test_unseen": {
+        "n": 122788,
+        "top1_successes": 65614,
+        "top5_successes": 99105,
+        "oracle_successes": 111641,
+        "top1": 0.5343681793009089,
+        "top5": 0.8071228458807049,
+        "oracle_pool": 0.9092175131120305,
+        "scenes": 40000
+      },
+      "h_top1": 0.6067078835984493,
+      "h_top5": 0.8290208191086291
+    },
+    "refined_heatmap_contact": {
+      "test_seen": {
+        "n": 208116,
+        "top1_successes": 146107,
+        "top5_successes": 176037,
+        "oracle_successes": 196235,
+        "top1": 0.7020459743604528,
+        "top5": 0.845860001153203,
+        "oracle_pool": 0.942911645428511,
+        "scenes": 40000
+      },
+      "test_unseen": {
+        "n": 122788,
+        "top1_successes": 66323,
+        "top5_successes": 99376,
+        "oracle_successes": 115498,
+        "top1": 0.5401423591881943,
+        "top5": 0.8093299019448155,
+        "oracle_pool": 0.9406293774635958,
+        "scenes": 40000
+      },
+      "h_top1": 0.6105431175099327,
+      "h_top5": 0.8271918412636948
+    }
+  }
+}
