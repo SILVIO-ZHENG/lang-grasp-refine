@@ -20,11 +20,7 @@ from panels import TEST_GROUPS, json_lines, load_panel_shard, manifest, row_key,
 # These keys match the archived evaluation schema and identify the same
 # methods even if the implementation directories are renamed.
 # 这些键与已保存的评测格式一致。即使实现目录改名，它们仍指向同样的方法。
-METHODS = ("grounded_zoom", "geometry_refinement", "refined_heatmap_contact")
-COMPARISONS = {
-    "refinement": METHODS[:2],
-    "contacts": METHODS[1:],
-}
+METHODS = ("grounded_zoom", "geometry_refinement")
 TRANSITIONS = ("00", "01", "10", "11")
 RECEIPT_VERSION = 1
 COUNTS = ("top1_successes", "top5_successes", "oracle_successes")
@@ -59,9 +55,8 @@ def count_shard(panel_rows, predictions, transitions):
         if any(type(hit) is not bool for hit in outcomes.values()):
             raise ValueError(f"Expected boolean success flags: {predictions}")
         successes.update(method for method, hit in outcomes.items() if hit)
-        for name, (before, after) in COMPARISONS.items():
-            transition = f"{int(outcomes[before])}{int(outcomes[after])}"
-            transitions[name][transition] += 1
+        before, after = (int(outcomes[method]) for method in METHODS)
+        transitions[f"{before}{after}"] += 1
     return successes
 
 
@@ -77,7 +72,7 @@ def audit(panels, evaluation):
         panel = data["groups"][group]
         expected = panel["shards"]
         totals = {method: Counter() for method in METHODS}
-        transitions[group] = {name: dict.fromkeys(TRANSITIONS, 0) for name in COMPARISONS}
+        transitions[group] = {"refinement": dict.fromkeys(TRANSITIONS, 0)}
         n_rows = 0
         for index, shard in enumerate(expected):
             panel_rows = load_panel_shard(panels, data, group, index)
@@ -87,7 +82,7 @@ def audit(panels, evaluation):
             if not isinstance(fit_digest, str) or not fit_digest:
                 raise ValueError(f"Missing fitted-head digest: {path.with_suffix('.json')}")
 
-            observed = count_shard(panel_rows, path, transitions[group])
+            observed = count_shard(panel_rows, path, transitions[group]["refinement"])
             for method, total in totals.items():
                 values = receipt["counts"][method]
                 top1, top5, pool = (values[key] for key in COUNTS)

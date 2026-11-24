@@ -49,21 +49,6 @@
         "top5": 0.8531494140625,
         "oracle_pool": 0.93408203125
       }
-    },
-    "refined_heatmap_contact": {
-      "weights": [
-        0.8,
-        -3.5
-      ],
-      "val": {
-        "n": 8192,
-        "top1_successes": 5770,
-        "top5_successes": 6933,
-        "oracle_successes": 7750,
-        "top1": 0.704345703125,
-        "top5": 0.8463134765625,
-        "oracle_pool": 0.946044921875
-      }
     }
   },
   "offline_2d": {
@@ -114,30 +99,6 @@
       },
       "h_top1": 0.6067078835984493,
       "h_top5": 0.8290208191086291
-    },
-    "refined_heatmap_contact": {
-      "test_seen": {
-        "n": 208116,
-        "top1_successes": 146107,
-        "top5_successes": 176037,
-        "oracle_successes": 196235,
-        "top1": 0.7020459743604528,
-        "top5": 0.845860001153203,
-        "oracle_pool": 0.942911645428511,
-        "scenes": 40000
-      },
-      "test_unseen": {
-        "n": 122788,
-        "top1_successes": 66323,
-        "top5_successes": 99376,
-        "oracle_successes": 115498,
-        "top1": 0.5401423591881943,
-        "top5": 0.8093299019448155,
-        "oracle_pool": 0.9406293774635958,
-        "scenes": 40000
-      },
-      "h_top1": 0.6105431175099327,
-      "h_top5": 0.8271918412636948
     }
   }
 }

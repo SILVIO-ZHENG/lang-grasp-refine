@@ -1,11 +1,10 @@
-"""Shared candidate generation and scoring for the two learned 2-D variants."""
+"""Generate and score original and refined 2-D grasp proposals."""
 
-# Generate proposals with frozen backbones, construct supervision for the two
-# candidate heads, and reuse the same scoring rules in validation and test.
-# 用冻结的主模型生成候选，为两个候选头构造监督，并在验证与测试中复用同一套评分规则。
+# Generate candidates with the frozen heatmap model and use the same scoring
+# rules for baseline and refinement during validation and testing.
+# 用冻结的热图模型生成候选，验证和测试时以同样的规则分别给原框和细化框打分。
 
 import itertools
-from pathlib import Path
 import sys
 
 import numpy as np
@@ -19,8 +18,7 @@ from panels import ROOT, load_panel_shard, read_regions, shard_path
 # directly without installing the repository as a Python package.
 # 从发布目录加载共享代码，允许直接运行入口脚本，无需先安装为 Python 包。
 sys.path[:0] = [str(ROOT), str(ROOT / 'common')]
-from candidate_features import K, agreement, candidate_rgb, feature_vector, supervised_targets
-from dual_contact_ranking.ranking import merge_scores
+from candidate_features import K, candidate_rgb, feature_vector, supervised_targets
 from evaluate_seen_unseen import load_checkpoint
 from geometry_refinement.refinement import apply_delta
 from grounded_baseline import OBJECT_WEIGHTS, PART_WEIGHTS, region_scores
@@ -28,19 +26,16 @@ from learned import predict_learned, restore_learned
 from run_experiment import SIZE, correct, normalized, tokenize
 
 
-MODEL_NAMES = ('01_film_dense', '08_contact_pairs')
-MODEL_DIRECTORIES = dict(zip(MODEL_NAMES, ('geometry_refinement', 'dual_contact_ranking'), strict=True))
-VARIANTS = ('grounded_zoom', 'geometry_refinement', 'refined_heatmap_contact')
+BACKBONE_ID = '01_film_dense'
+VARIANTS = ('grounded_zoom', 'geometry_refinement')
 
 # Search these score weights and residual scales on validation Top-1 only.
 # 这些评分权重和残差缩放系数仅使用验证集 Top-1 进行选择。
 COEFFICIENTS = (0.15, 0.35, 0.65, 1.0, 1.6)
 SHRINKS = (0.3, 0.6, 1.0)
-REFINED_RANK = (0.0, 0.35, 0.8)
-CONTACT_BIAS = (-3.5, -2.5, -1.5, -0.5)
 
 
-def backbone_paths(root, method, tag):
+def backbone_paths(root, tag):
     """Resolve source and weights while retaining the archive's method IDs.
 
     A benchmark root may use the current method folders or the original
@@ -52,9 +47,9 @@ def backbone_paths(root, method, tag):
     实验根目录可使用现在的方案文件夹，也可使用历史目录名。指纹核验所选目录中
     实际读取的源码、检查点与词表。
     """
-    directory = root / MODEL_DIRECTORIES[method]
+    directory = root / 'geometry_refinement'
     if not (directory / 'model.py').is_file():
-        directory = root / method
+        directory = root / BACKBONE_ID
     return directory / 'model.py', directory / tag
 
 
@@ -109,88 +104,67 @@ def get_hits(boxes, truth):
 
 
 class ProposalBank:
-    # The two checkpoint tuples hold the model definition, evaluation-mode
-    # weights, vocabulary, and selected epoch for each proposal branch.
-    # 两路检查点各自保存模型定义、评估模式下的权重、词表和选中的训练轮次。
+    # The checkpoint provides the heatmap model, its vocabulary, and the
+    # selected training epoch.
+    # 检查点提供热图模型、对应的词表及选中的训练轮次。
     def __init__(self, root, tag, device, fit=None):
         self.device = torch.device(device)
-        self.base, self.aux = (load_checkpoint(*backbone_paths(root, name, tag), device)
-                               for name in MODEL_NAMES)
+        self.base = load_checkpoint(*backbone_paths(root, tag), device)
         self.selection = None
         if fit is not None:
             self.attach_fit(*fit)
 
     def attach_fit(self, settings, folder):
-        # Load the validation settings and trained heads as a matched pair.
-        # 同时加载配套的验证集评分配置和已训练的候选头。
+        # Load the refiner together with the scoring settings chosen on validation.
+        # 同时加载细化模型和在验证集上选出的评分配置。
         self.selection = settings
-        self.ranker, self.refiner = (
-            restore_learned(torch.load(folder / name, map_location='cpu', weights_only=True), self.device)
-            for name in ('learned_ranking.pt', 'pose_refiner.pt')
-        )
+        checkpoint = torch.load(folder / 'pose_refiner.pt', map_location='cpu', weights_only=True)
+        self.refiner = restore_learned(checkpoint, self.device)
 
-    def _proposals(self, model_info, images, prompts):
-        # Tokenize with this backbone's own vocabulary. Both decoders return
-        # the same normalized pose format [B, 24, 5] even though the contact
-        # model predicts endpoints before decoding.
-        # 使用当前主模型自己的词表编码指令。两路解码后统一为 [B, 24, 5] 的
-        # 归一化抓取框，双接触点模型在解码前输出的是端点。
-        method, model, vocabulary, _ = model_info
+    def _proposals(self, images, prompts):
+        # Use the training vocabulary and decode normalized poses [B, 24, 5].
+        # 使用训练时的词表和模型，解码出归一化抓取框 [B, 24, 5]。
+        method, model, vocabulary, _ = self.base
         words = torch.stack([tokenize(prompt, vocabulary) for prompt in prompts]).to(self.device)
         boxes = method.decode(model(images, words), topk=K).float()
         if boxes.shape != (len(images), K, 5):
             raise ValueError(f'Expected one grasp pool [{len(images)},{K},5], got {tuple(boxes.shape)}')
         return boxes
 
-    def raw(self, images, prompts, regions, include_aux=True):
-        # Extract features in inference mode to keep both backbone outputs
-        # fixed during head training. The feature vector uses RGB sampled at
-        # each proposal, grounding evidence, and proposal metadata.
-        # 在推理模式提取特征，在候选头训练时固定两路主模型的输出。特征来自候选周围的 RGB
-        # 采样、定位结果和候选自身的信息。
+    def raw(self, images, prompts, regions):
+        # Freeze the proposal model while preparing refiner features from local
+        # RGB samples, grounding evidence, and proposal metadata.
+        # 准备细化模型的输入时冻结候选模型，输入来自候选周围的 RGB 采样、定位结果和候选自身的信息。
         with torch.inference_mode():
             images = images.to(self.device, non_blocking=True)
-            dense = self._proposals(self.base, images, prompts)
+            dense = self._proposals(images, prompts)
             patches = candidate_rgb(images, dense)
             dense = dense.cpu().numpy()
-            aux = self._proposals(self.aux, images, prompts).cpu().numpy() if include_aux else None
             features = np.stack([feature_vector(box, detections, rgb)
                                  for box, detections, rgb in zip(dense, regions, patches, strict=True)])
-        return images, dense, aux, features
+        return dense, features
 
     def learned(self, dense, features):
-        # Both heads read the original heatmap boxes. The ranker returns a
-        # score, and the refiner returns a quality score plus five pose edits.
-        # 两个头都读取原始热图抓取框。排序头输出分数，细化头输出质量分数和五维位姿修正。
+        # Predict a calibrated score and five pose edits for each original box.
+        # 为每个原始抓取框预测校准后的质量分数和五维位姿修正。
         values = {'boxes': dense, 'features': features}
-        rank, _ = predict_learned(self.ranker, values, self.device)
         refine, delta = predict_learned(self.refiner, values, self.device)
-        return np.clip(rank, -6, 6), np.clip(refine, -6, 6), delta
+        return np.clip(refine, -6, 6), delta
 
     def results(self, images, prompts, regions):
-        # Return one aligned candidate and score list per method for each
-        # instruction. The first K entries of the combined list remain the
-        # refined heatmap boxes so their scores and labels can be reused.
-        # 为每条指令返回三种方法各自对齐的候选和分数。合并列表的前 K 项仍是
-        # 细化后的热图框，因此能复用这部分分数和标注匹配结果。
-        _, dense, aux, features = self.raw(images, prompts, regions)
-        rank, refine, delta = self.learned(dense, features)
+        # Return corresponding boxes and scores before and after refinement.
+        # 返回细化前后对应的抓取框和分数。
+        dense, features = self.raw(images, prompts, regions)
+        refine, delta = self.learned(dense, features)
         weights = self.selection['grounded_zoom']['weights']
         refine_weight, shrink = self.selection['geometry_refinement']['weights']
-        rank_weight, contact_bias = self.selection['refined_heatmap_contact']['weights']
         refined = apply_delta(dense, delta * shrink)
-        combo = np.concatenate((refined, aux), axis=1)
         for i, detection in enumerate(regions):
-            # Recompute grounding after moving a box. Only the refined
-            # heatmap branch gets the extra learned rank score; contact boxes
-            # instead receive a validation-selected branch offset.
-            # 抓取框移动后重新计算定位支持度。额外排序分数只加在细化热图分支，
-            # 双接触点分支则使用验证集选出的分数偏置。
+            # Recompute grounding from the new coordinates and add the learned score.
+            # 按细化后的坐标重新计算定位支持度，并加上细化模型的质量分数。
             before = grounded(geometry(dense[i], detection), weights)
             after = grounded(geometry(refined[i], detection), weights) + refine_weight * refine[i]
-            contact = grounded(geometry(aux[i], detection), weights)
-            combined = merge_scores(after, rank[i], contact, rank_weight, contact_bias)
-            yield dense[i], before, refined[i], after, combo[i], combined
+            yield dense[i], before, refined[i], after
 
 
 def batches(args, rows, regions):
@@ -213,9 +187,8 @@ def batches(args, rows, regions):
 
 
 def fitting_records(args, bank, data, digest, group, detector=None):
-    # Build head-learning records from the requested training or validation
-    # shard. Contact proposals are needed only when validating the joint ranking.
-    # 读取指定的训练集或验证集分片来构造候选头样本。双接触点候选仅用于验证联合排序。
+    # Build refiner training records and keep validation geometry for score selection.
+    # 构造细化模型的训练样本，并在验证时保留位置和标注以选择评分配置。
     validation = group == 'val'
     data_shards = data['groups'][group]['shards']
     for index in range(len(data_shards)):
@@ -226,7 +199,7 @@ def fitting_records(args, bank, data, digest, group, detector=None):
         # 记录当前检测器指纹，后续所有分片都需要与它一致。
         detector = detector_id
         for images, _, prompts, regions, truths in batches(args, rows, detections):
-            _, dense, aux, features = bank.raw(images, prompts, regions, include_aux=validation)
+            dense, features = bank.raw(images, prompts, regions)
             # Supervise success and quality for each heatmap proposal. Supply
             # a matched rectangle and a mask that enables pose regression
             # only for candidates close enough to their chosen label.
@@ -236,35 +209,22 @@ def fitting_records(args, bank, data, digest, group, detector=None):
             correct, quality, matched, regresses = [np.stack(values) for values in zip(*targets, strict=True)]
             dataset = {'features': features, 'boxes': dense, 'correct': correct, 'quality': quality,
                        'target': matched, 'regress': regresses}
-            yield dataset, (aux, regions, truths) if validation else None, detector_id
+            yield dataset, (regions, truths) if validation else None, detector_id
         print('HEAD_INPUT', group, index, len(data_shards), len(rows), flush=True)
 
 
-def score_order(scores, allowed=None):
-    # Sort by decreasing score and keep the input order for ties. When a
-    # shortlist is supplied, return indices into the original candidate list.
-    # 按分数降序排列，同分时保留输入顺序。若提供候选子集，则返回原始列表中的索引。
-    order = np.argsort(-scores, kind='stable') if allowed is None else allowed[np.argsort(-scores[allowed], kind='stable')]
-    return order
+def score_order(scores):
+    # Sort by decreasing score and keep the input order for ties.
+    # 按分数降序排列，同分时保留输入顺序。
+    return np.argsort(-scores, kind='stable')
 
 
-def measure(boxes, hits, order, suppress=False):
+def measure(hits, order):
     # Count first-choice success, any success among the selected five, and
-    # coverage of the full pool. Only the Top-5 selection can suppress
-    # proposals that have very similar centers and angles.
-    # 分别统计首选是否成功、选出的五项中是否有成功框，以及整个候选池是否覆盖
-    # 有效抓取。相近中心与角度的候选只会在 Top-5 选择时被压制。
+    # coverage of the full pool.
+    # 分别统计首选是否成功、前五项中是否有成功框，以及候选池是否包含有效抓取。
     top = int(order[0])
-    chosen = order[:5]
-    if suppress:
-        chosen = []
-        for index in order:
-            if chosen and agreement(boxes[index:index + 1], boxes[chosen])[0] > 0.94:
-                continue
-            chosen.append(int(index))
-            if len(chosen) == 5:
-                break
-    return int(hits[top]), int(hits[chosen].any()), int(hits.any()), top
+    return int(hits[top]), int(hits[order[:5]].any()), int(hits.any()), top
 
 
 def _best_grid(configs, scorer):
@@ -279,13 +239,12 @@ def _top1(hits, values):
     return int(np.take_along_axis(hits, values.argmax(axis=1, keepdims=True), axis=1).sum())
 
 
-def _validation_metrics(boxes, hits, rows, suppress=False):
+def _validation_metrics(hits, rows):
     # Reuse the same selection and hit counting as the test benchmark.
     # 复用测试评测的候选选择和成功统计规则。
-    candidates = (measure(poses, correct, score_order(scores), suppress)
-                  for poses, correct, scores in zip(boxes, hits, rows, strict=True))
+    candidates = (measure(correct, score_order(scores)) for correct, scores in zip(hits, rows, strict=True))
     first, first_five, covered, _ = map(sum, zip(*candidates, strict=True))
-    return metrics(len(boxes), {'top1_successes': first, 'top5_successes': first_five, 'oracle_successes': covered})
+    return metrics(len(rows), {'top1_successes': first, 'top5_successes': first_five, 'oracle_successes': covered})
 
 
 def metrics(n, counts):
@@ -295,15 +254,14 @@ def metrics(n, counts):
             'top5': counts['top5_successes'] / n, 'oracle_pool': counts['oracle_successes'] / n}
 
 
-def select(bank, validation, aux, regions, truths):
+def select(bank, validation, regions, truths):
     # Tune in stages on validation. Freeze the baseline weights before
-    # choosing refinement settings, then freeze those while merging branches.
-    # 在验证集分阶段调参。固定基线权重后选择细化配置，固定细化配置后再合并两路。
+    # choosing the residual scale and learned-score weight.
+    # 在验证集先选基线权重，再固定它来选择残差缩放和质量分权重。
     dense = validation['boxes']
     dense_hits = validation['correct']
     dense_geo = np.stack([geometry(boxes, detected) for boxes, detected in zip(dense, regions, strict=True)])
-    aux_geo = np.stack([geometry(boxes, detected) for boxes, detected in zip(aux, regions, strict=True)])
-    rank, refine, delta = bank.learned(dense, validation['features'])
+    refine, delta = bank.learned(dense, validation['features'])
     prior = -np.log1p(np.arange(K))
     base = _best_grid(itertools.product((*OBJECT_WEIGHTS[1:], 12.0), PART_WEIGHTS[1:]),
                       lambda weights: _top1(dense_hits, prior + dense_geo @ weights))
@@ -316,28 +274,11 @@ def select(bank, validation, aux, regions, truths):
         hits = np.stack([get_hits(poses, truth) for poses, truth in zip(boxes, truths, strict=True)])
         scores = np.stack([grounded(geometry(poses, detected), base)
                            for poses, detected in zip(boxes, regions, strict=True)])
-        refine_candidates[shrink] = boxes, hits, scores
+        refine_candidates[shrink] = hits, scores
     scale, shrink = _best_grid(itertools.product(COEFFICIENTS, SHRINKS), lambda config: _top1(
-        refine_candidates[config[1]][1], refine_candidates[config[1]][2] + config[0] * refine))
-    boxes, hits, score = refine_candidates[shrink]
-    score = score + scale * refine
-    aux_hits = np.stack([get_hits(poses, truth) for poses, truth in zip(aux, truths, strict=True)])
-    aux_score = prior + aux_geo @ base
-    combo_boxes = np.concatenate((boxes, aux), axis=1)
-    combo_hits = np.concatenate((hits, aux_hits), axis=1)
-
-    def combine(config):
-        # The rank weight affects the refined heatmap branch. A constant
-        # offset calibrates contact scores against it and preserves their order.
-        # 排序权重用于第一路。偏置校准双接触点分支与第一路的相对分数，
-        # 不改变双接触点分支内部的候选顺序。
-        rank_weight, bias = config
-        return merge_scores(score, rank, aux_score, rank_weight, bias)
-
-    combo = _best_grid(itertools.product(REFINED_RANK, CONTACT_BIAS),
-                       lambda config: _top1(combo_hits, combine(config)))
+        refine_candidates[config[1]][0], refine_candidates[config[1]][1] + config[0] * refine))
+    hits, scores = refine_candidates[shrink]
     return {
-        'grounded_zoom': {'weights': base, 'val': _validation_metrics(dense, dense_hits, prior + dense_geo @ base)},
-        'geometry_refinement': {'weights': (scale, shrink), 'val': _validation_metrics(boxes, hits, score)},
-        'refined_heatmap_contact': {'weights': combo, 'val': _validation_metrics(combo_boxes, combo_hits, combine(combo), True)},
+        'grounded_zoom': {'weights': base, 'val': _validation_metrics(dense_hits, prior + dense_geo @ base)},
+        'geometry_refinement': {'weights': (scale, shrink), 'val': _validation_metrics(hits, scores + scale * refine)},
     }

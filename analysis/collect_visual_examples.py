@@ -14,8 +14,7 @@ from collect_paired_counts import METHODS, read_receipt
 
 
 ROOT = Path(__file__).resolve().parents[1]
-BASELINE, GEOMETRY, CONTACTS = METHODS
-BEFORE_AFTER = {GEOMETRY: (BASELINE, GEOMETRY), CONTACTS: (GEOMETRY, CONTACTS)}
+BASELINE, GEOMETRY = METHODS
 
 
 def target_name(prompt):
@@ -64,16 +63,16 @@ def run(args):
         union = (pose[2] * pose[3] + gt[2] * gt[3]) * SIZE**2 - intersection
         return intersection / union if union > 0 else 0.0
 
-    def center_scores(model_data, images, prompts):
-        # Render the branch's predicted center probabilities, before any
+    def center_scores(images, prompts):
+        # Render the heatmap model's center probabilities, before any
         # pose decoding or final score, in the paper's center-map panel.
-        # 论文的中心热图面板显示当前分支在位姿解码和最终打分前预测的中心概率。
-        _, model, vocabulary, _ = model_data
+        # 论文的热图面板显示热图模型在位姿解码和最终打分前预测的中心概率。
+        _, model, vocabulary, _ = bank.base
         words = torch.stack([tokenize(prompt, vocabulary) for prompt in prompts]).to(bank.device)
         with torch.inference_mode():
             return model(images.to(bank.device), words)[0].sigmoid().cpu().numpy()
 
-    def candidates_for_shard(group, index, panel_rows, collected, represented):
+    def candidates_for_shard(group, index, panel_rows, represented):
         path = shard_path(args.evaluation, group, index)
         read_receipt(path, digest, len(panel_rows), fit_digest)
         candidates = []
@@ -82,92 +81,75 @@ def run(args):
                 raise ValueError(f"Prediction rows do not match the panel: {path}")
             if row["image"] in used or len(row["prompt"]) > 44 or min(row["gt"][2:4]) < 0.032:
                 continue
-            for kind, (before, after) in BEFORE_AFTER.items():
-                if len(collected[kind]) == args.examples or target_name(row["prompt"]) in represented[kind]:
-                    continue
-                first, second = (row["methods"][name] for name in (before, after))
-                truth = np.asarray([row["gt"]], dtype=np.float32)
-                box = np.asarray(second["prediction"])
-                # Choose a miss-to-hit example whose single displayed label
-                # also confirms the hit. Keep poses away from image edges.
-                # 选择从失败变为成功、且图中这一条标注也能证实成功的样例，
-                # 同时让抓取框远离图像边缘。
-                if first["success"] or not second["success"] or not correct(box, truth):
-                    continue
-                if min(box[:2]) < 0.08 or max(box[:2]) > 0.92:
-                    continue
-                if kind == GEOMETRY:
-                    distance = np.linalg.norm(np.subtract(first["prediction"][:2], box[:2]))
-                    if not 0.017 < distance < 0.15:
-                        continue
-                candidates.append((offset, kind, row))
+            if target_name(row["prompt"]) in represented:
+                continue
+            first, second = (row["methods"][name] for name in (BASELINE, GEOMETRY))
+            truth = np.asarray([row["gt"]], dtype=np.float32)
+            box = np.asarray(second["prediction"])
+            # Choose a miss-to-hit example whose single displayed label
+            # also confirms the hit. Keep poses away from image edges.
+            # 选择从失败变为成功、且图中这一条标注也能证实成功的样例，
+            # 同时让抓取框远离图像边缘。
+            if first["success"] or not second["success"] or not correct(box, truth):
+                continue
+            if min(box[:2]) < 0.08 or max(box[:2]) > 0.92:
+                continue
+            distance = np.linalg.norm(np.subtract(first["prediction"][:2], box[:2]))
+            if 0.017 < distance < 0.15:
+                candidates.append((offset, row))
         return candidates
 
     def collect(group):
-        collected = {kind: [] for kind in BEFORE_AFTER}
-        represented = {kind: set() for kind in BEFORE_AFTER}
+        collected = []
+        represented = set()
         group_shards = data["groups"][group]["shards"]
         for index in range(min(args.shards, len(group_shards))):
             panel_rows = load_panel_shard(args.panels, data, group, index)
-            candidates = candidates_for_shard(group, index, panel_rows, collected, represented)
+            candidates = candidates_for_shard(group, index, panel_rows, represented)
             if not candidates:
                 continue
             cached, _ = read_regions(shard_path(args.cache, group, index), panel_rows, digest, fit["detector"])
             for start in range(0, len(candidates), args.batch):
-                batch = [(offset, kind, row) for offset, kind, row in candidates[start:start + args.batch]
-                         if len(collected[kind]) < args.examples and row["image"] not in used]
+                batch = [(offset, row) for offset, row in candidates[start:start + args.batch]
+                         if row["image"] not in used and target_name(row["prompt"]) not in represented]
                 if not batch:
                     continue
-                rows = [row for _, _, row in batch]
+                rows = [row for _, row in batch]
                 dataset = Images(rows, args.images)
                 images = torch.stack([dataset[i][0] for i in range(len(batch))])
                 prompts = [row["prompt"] for row in rows]
-                actual = bank.results(images, prompts, [cached[offset] for offset, _, _ in batch])
-                maps = {kind: center_scores(model, images, prompts) for kind, model in
-                        ((GEOMETRY, bank.base), (CONTACTS, bank.aux)) if any(k == kind for _, k, _ in batch)}
+                actual = bank.results(images, prompts, [cached[offset] for offset, _ in batch])
+                maps = center_scores(images, prompts)
 
-                for member, ((_, kind, row), trace) in enumerate(zip(batch, actual, strict=True)):
+                for member, ((_, row), trace) in enumerate(zip(batch, actual, strict=True)):
                     target = target_name(row["prompt"])
-                    if len(collected[kind]) >= args.examples or row["image"] in used or target in represented[kind]:
+                    if row["image"] in used or target in represented:
                         continue
-                    raw, baseline_score, refined, refine_score, combined, combo_score = trace
+                    raw, baseline_score, refined, refine_score = trace
                     baseline_id = int(score_order(baseline_score)[0])
                     refine_id = int(score_order(refine_score)[0])
-                    combo_id = int(score_order(combo_score)[0])
-                    before_id, after_id = BEFORE_AFTER[kind]
-                    before, after = (row["methods"][name]["prediction"] for name in (before_id, after_id))
-
-                    # The geometry case must preserve the winning heatmap
-                    # index. The contact case must select an appended box.
-                    # 几何细化样例的首选必须仍是同一个热图候选。接触点样例的首选
-                    # 必须来自附加的接触点候选。
-                    if kind == GEOMETRY:
-                        if baseline_id != refine_id:
-                            continue
-                        replayed = (raw[baseline_id], refined[refine_id])
-                        winner = refine_id
-                    else:
-                        if combo_id < len(refined):
-                            continue
-                        replayed = (refined[refine_id], combined[combo_id])
-                        winner = combo_id
+                    before, after = (row["methods"][name]["prediction"] for name in (BASELINE, GEOMETRY))
+                    # Require the same winning candidate before and after refinement.
+                    # 细化前后必须选中同一个原始抓取候选。
+                    if baseline_id != refine_id:
+                        continue
+                    replayed = (raw[baseline_id], refined[refine_id])
                     if not np.allclose(replayed, (before, after), atol=1e-4, rtol=1e-5):
                         continue
                     gt = row["gt"]
-                    collected[kind].append({
+                    collected.append({
                         "image": row["image"], "prompt": row["prompt"], "groundTruth": gt,
-                        "before": before, "after": after, "map": maps[kind][member].round(5).tolist(),
+                        "before": before, "after": after, "map": maps[member].round(5).tolist(),
                         "beforeSuccess": False, "afterSuccess": True,
                         "beforeIoU": overlap(before, gt), "afterIoU": overlap(after, gt),
                         "beforeAngle": angle_error(before, gt), "afterAngle": angle_error(after, gt),
-                        "sameCandidate": kind == GEOMETRY, "winnerIndex": winner,
+                        "sameCandidate": True, "winnerIndex": refine_id,
                     })
-                    represented[kind].add(target)
+                    represented.add(target)
                     used.add(row["image"])
-            if all(len(cases) == args.examples for cases in collected.values()):
-                return collected
-        counts = {kind: len(cases) for kind, cases in collected.items()}
-        raise RuntimeError(f"Too few matching examples in the requested shards for {group}: {counts}")
+                    if len(collected) == args.examples:
+                        return {GEOMETRY: collected}
+        raise RuntimeError(f"Too few matching examples in the requested shards for {group}: {len(collected)}")
 
     groups = {group: collect(group) for group in args.groups}
     print(json.dumps(groups, separators=(",", ":")))
@@ -177,13 +159,13 @@ def main():
     from panels import TEST_GROUPS, positive
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--root", type=Path, default=ROOT, help="Directory containing the two backbone runs")
+    parser.add_argument("--root", type=Path, default=ROOT, help="Directory containing the heatmap backbone run")
     for path in ("panels", "cache", "evaluation", "fit", "images"):
         parser.add_argument(f"--{path}", required=True, type=Path)
     parser.add_argument("--tag", required=True, help="Backbone run directory name")
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--groups", nargs="+", choices=TEST_GROUPS, default=TEST_GROUPS)
-    parser.add_argument("--examples", type=positive, default=2, help="Number of examples per method and split")
+    parser.add_argument("--examples", type=positive, default=2, help="Number of examples per split")
     parser.add_argument("--shards", type=positive, default=24, help="Maximum shards scanned per split")
     parser.add_argument("--batch", type=positive, default=16)
     args = parser.parse_args()

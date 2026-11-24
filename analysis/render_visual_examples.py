@@ -17,7 +17,6 @@ SIZE = 400
 LABEL = "#e6fa73"
 BEFORE = "#ff4667"
 AFTER = "#18ecff"
-METHODS = {"geometry": "geometry_refinement", "dual": "refined_heatmap_contact"}
 
 
 def corners(box):
@@ -73,7 +72,7 @@ def stroke(draw, vertices, color, dashed=False):
             draw.line(segment, fill=color, width=5)
 
 
-def pose_image(base, row, field, variant, stage):
+def pose_image(base, row, field, stage):
     """Overlay the prediction and one displayed label on the same RGB crop.
 
     在同一张 RGB 裁剪图上画出预测框和本例展示的单个标注框。
@@ -84,17 +83,8 @@ def pose_image(base, row, field, variant, stage):
     chosen = row[stage]
     color = BEFORE if stage == "before" else AFTER
     stroke(draw, point(corners(chosen), field), color)
-    x, y, width, _, theta = chosen
-    if variant == "dual" and stage == "after":
-        # Recover the two contacts using the decoded center, opening and angle.
-        # 用解码后的中心、夹爪开口和角度还原两个接触点。
-        half = np.array([math.cos(theta), math.sin(theta)]) * width / 2
-        center = np.array([x, y])
-        positions = [center - half, center + half]
-    else:
-        positions = [[x, y]]
-    for u, v in point(positions, field):
-        draw.ellipse((u - 7, v - 7, u + 7, v + 7), fill=color, outline="#111822", width=3)
+    u, v = point(chosen[:2], field)
+    draw.ellipse((u - 7, v - 7, u + 7, v + 7), fill=color, outline="#111822", width=3)
     return result
 
 
@@ -118,36 +108,35 @@ def generate(trace, images, destination):
     """
     measurements = json.loads(trace.read_text(encoding="utf-8-sig"))
     destination.mkdir(parents=True, exist_ok=True)
-    records = {method: [] for method in METHODS}
-    for name, model in METHODS.items():
-        for split, label in (("seen", "Seen"), ("unseen", "Unseen")):
-            for i, case in enumerate(measurements.get(f"test_{split}", {}).get(model, ())):
-                tag = f"{split}{i + 1}" if i else split
-                field = view(case)
-                with Image.open(images / case["image"]) as source:
-                    image = source.convert("RGB")
-                w, h = image.size
-                if w != h:
-                    side = max(w, h)
-                    square = Image.new("RGB", (side, side))
-                    square.paste(image, ((side - w) // 2, (side - h) // 2))
-                    image = square
-                base = crop(image, field)
-                outputs = {"raw": base, "map": heatmap(base, case, field)}
-                for phase in ("before", "after"):
-                    outputs[phase] = pose_image(base, case, field, name, phase)
-                for panel, picture in outputs.items():
-                    picture.save(destination / f"{name}_{tag}_{panel}.png", optimize=True)
-                # Display metrics refer to one visible annotation. The success
-                # flags still come from the evaluation against all annotations.
-                # 展示的指标对应图中这一条标注。成功标志仍来自对全部标注的正式评测。
-                row = {k: case[k] for k in ("prompt", "beforeSuccess", "afterSuccess", "sameCandidate", "winnerIndex")}
-                row.update(tag=tag, label=label)
-                for phase in ("before", "after"):
-                    row[f"{phase}Metric"] = f'IoU {case[f"{phase}IoU"]:.2f}, {case[f"{phase}Angle"]:.0f}°'
-                records[name].append(row)
+    records = []
+    for split, label in (("seen", "Seen"), ("unseen", "Unseen")):
+        for i, case in enumerate(measurements.get(f"test_{split}", {}).get("geometry_refinement", ())):
+            tag = f"{split}{i + 1}" if i else split
+            field = view(case)
+            with Image.open(images / case["image"]) as source:
+                image = source.convert("RGB")
+            w, h = image.size
+            if w != h:
+                side = max(w, h)
+                square = Image.new("RGB", (side, side))
+                square.paste(image, ((side - w) // 2, (side - h) // 2))
+                image = square
+            base = crop(image, field)
+            outputs = {"raw": base, "map": heatmap(base, case, field)}
+            for phase in ("before", "after"):
+                outputs[phase] = pose_image(base, case, field, phase)
+            for panel, picture in outputs.items():
+                picture.save(destination / f"geometry_{tag}_{panel}.png", optimize=True)
+            # Display metrics refer to one visible annotation. The success
+            # flags still come from the evaluation against all annotations.
+            # 展示的指标对应图中这一条标注。成功标志仍来自对全部标注的正式评测。
+            row = {k: case[k] for k in ("prompt", "beforeSuccess", "afterSuccess", "sameCandidate", "winnerIndex")}
+            row.update(tag=tag, label=label)
+            for phase in ("before", "after"):
+                row[f"{phase}Metric"] = f'IoU {case[f"{phase}IoU"]:.2f}, {case[f"{phase}Angle"]:.0f}°'
+            records.append(row)
     (destination / "samples.json").write_text(
-        json.dumps(records, indent=2, ensure_ascii=False) + "\n", encoding="utf-8",
+        json.dumps({"geometry": records}, indent=2, ensure_ascii=False) + "\n", encoding="utf-8",
     )
 
 

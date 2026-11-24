@@ -1,14 +1,13 @@
-"""Learn to score a list of grasp candidates and optionally refine their poses.
+"""Learn to correct and score a list of grasp candidates.
 
-The ranking head learns which proposals should come first. The refinement head
-also predicts bounded corrections to the center, size, and angle. Both heads
-learn from training candidates and use validation candidates for checkpoint
-selection and score calibration.
+The refiner predicts bounded corrections to the center, size, and angle of
+each box and learns which corrected boxes should come first. Use validation
+candidates to select the checkpoint and calibrate the learned scores.
 
-学习对一组抓取候选评分，并可选地细化抓取位姿。
+学习修正一组抓取候选并为它们评分。
 
-排序头学习哪些候选应该排在前面。细化头还预测有界的中心、尺寸和角度修正。
-两个头均使用训练候选学习，通过验证候选选择权重并校准分数。
+细化模型预测每个框的有界中心、尺寸和角度修正，并学习哪些框在细化后应排在前面。
+使用验证集候选选择权重并校准分数。
 """
 
 import math
@@ -34,24 +33,23 @@ def _input(features, boxes):
 
 
 class CandidateModel(nn.Module):
-    """Score candidates jointly, with an optional five-value correction per pose.
+    """Score candidates jointly and predict five correction values per pose.
 
     A 155-value descriptor and six geometry values give 161 inputs per candidate
     in the reported experiments. The encoder maps them to 48 channels. The
     context MLP reads the local embedding, deviation from the list mean, and
     the elementwise list maximum.
 
-    联合处理一组抓取候选，并可选地为每个候选输出五维位姿修正。
+    联合处理一组抓取候选，为每个候选评分并输出五维位姿修正。
 
     报告中的实验将 155 维特征和六维几何编码拼成每个候选的 161 维输入。编码器
     将其映射到 48 维。上下文 MLP 读取候选自身的编码、它相对列表均值的偏差，
     以及整组候选按维度取出的最大值。
     """
 
-    def __init__(self, feature_dim, refine):
+    def __init__(self, feature_dim):
         super().__init__()
         self.feature_dim = feature_dim
-        self.refine = refine
         self.register_buffer("mean", torch.zeros(feature_dim + 6))
         self.register_buffer("std", torch.ones(feature_dim + 6))
         self.register_buffer("calibration", torch.tensor([1., 0.]))
@@ -59,23 +57,21 @@ class CandidateModel(nn.Module):
         self.encode = nn.Sequential(nn.Linear(feature_dim + 6, 64), nn.LayerNorm(64), nn.SiLU(), nn.Linear(64, 48))
         self.context = nn.Sequential(nn.Linear(144, 64), nn.LayerNorm(64), nn.SiLU())
         self.score = nn.Linear(64, 1)
-        self.residual = nn.Linear(64, 5) if refine else None
+        self.residual = nn.Linear(64, 5)
         # Start the refiner with zero corrections, preserving the input poses.
         # 让细化头从零修正开始，初始输出保持候选位姿不变。
-        if self.residual is not None:
-            nn.init.zeros_(self.residual.weight)
-            nn.init.zeros_(self.residual.bias)
+        nn.init.zeros_(self.residual.weight)
+        nn.init.zeros_(self.residual.bias)
 
     def forward(self, features, boxes):
         """Map [B,K,D] features and [B,K,5] poses to raw scores [B,K].
 
-        The second return value is [B,K,5] deltas for the refiner, or None for
-        a ranking-only head. Calibration is applied separately during prediction.
+        The second return value is [B,K,5] pose corrections. Calibration is
+        applied separately during prediction.
 
         将特征 [B,K,D] 和位姿 [B,K,5] 映射为原始分数 [B,K]。
 
-        细化头的第二项输出是 [B,K,5] 的修正量，纯排序头返回 None。
-        分数校准在推理时单独应用。
+        第二项输出是 [B,K,5] 的位姿修正量。分数校准在推理时单独应用。
         """
         values = ((_input(features, boxes) - self.mean) / self.std).clamp(-8, 8)
         local = self.encode(values)
@@ -83,7 +79,7 @@ class CandidateModel(nn.Module):
         peak = local.amax(dim=1, keepdim=True).expand_as(local)
         contextual = self.context(torch.cat((local, relative, peak), dim=-1))
         logits = self.score(contextual).squeeze(-1)
-        delta = None if self.residual is None else self.residual(contextual).tanh() * self.bounds
+        delta = self.residual(contextual).tanh() * self.bounds
         return logits, delta
 
 
@@ -92,13 +88,15 @@ def checkpoint_learned(model):
 
     在 CPU 上保存权重、特征统计量及校准参数的副本。
     """
-    return {"feature_dim": model.feature_dim, "refine": model.refine,
+    return {"feature_dim": model.feature_dim, "refine": True,
             "state_dict": {name: value.detach().cpu().clone() for name, value in model.state_dict().items()}}
 
 
 def restore_learned(checkpoint, device):
+    if checkpoint.get("refine") is not True:
+        raise ValueError("Expected a geometry-refiner checkpoint")
     with torch.random.fork_rng(devices=[]):
-        model = CandidateModel(checkpoint["feature_dim"], checkpoint["refine"])
+        model = CandidateModel(checkpoint["feature_dim"])
     model.load_state_dict(checkpoint["state_dict"])
     return model.to(device).eval()
 
@@ -216,26 +214,23 @@ def _refined_supervision(data, delta):
 
 
 def _train_objective(model, data, logits, delta):
-    """Train per-candidate success, ranking within each list, and optional deltas.
+    """Train candidate success, ranking within each list, and pose corrections.
 
-    训练每个候选的成功分数、同一列表内的排序，以及可选的位姿残差。
+    训练每个候选的成功分数、同一列表内的排序以及位姿修正量。
     """
-    correct, quality = data["correct"], data["quality"]
-    regression = logits.new_zeros(())
-    if delta is not None:
-        correct, quality = _refined_supervision(data, delta)
-        target, boxes = data["target"], data["boxes"]
-        # Supervise normalized residuals on matched boxes. A smaller penalty
-        # discourages unnecessary movement of candidates without usable targets.
-        # 对匹配框监督归一化残差。对缺少有效匹配的候选，用较小的惩罚约束无依据的移动。
-        xy = target[..., :2] - boxes[..., :2]
-        scale = (target[..., 2:4] / boxes[..., 2:4]).log()
-        angle = _wrap(target[..., 4:] - boxes[..., 4:])
-        desired = (torch.cat((xy, scale, angle), dim=-1) / model.bounds).clamp(-1, 1)
-        error = F.smooth_l1_loss(delta / model.bounds, desired, beta=0.2, reduction="none").mean(dim=-1)
-        mask = data["regress"]
-        regression = (error * mask).sum() / mask.sum().clamp_min(1)
-        regression = regression + 0.12 * ((delta / model.bounds).square().mean(dim=-1) * ~mask).mean()
+    correct, quality = _refined_supervision(data, delta)
+    target, boxes = data["target"], data["boxes"]
+    # Supervise normalized residuals on matched boxes. A smaller penalty
+    # discourages unnecessary movement of candidates without usable targets.
+    # 对匹配框监督归一化残差。对缺少有效匹配的候选，用较小的惩罚约束无依据的移动。
+    xy = target[..., :2] - boxes[..., :2]
+    scale = (target[..., 2:4] / boxes[..., 2:4]).log()
+    angle = _wrap(target[..., 4:] - boxes[..., 4:])
+    desired = (torch.cat((xy, scale, angle), dim=-1) / model.bounds).clamp(-1, 1)
+    error = F.smooth_l1_loss(delta / model.bounds, desired, beta=0.2, reduction="none").mean(dim=-1)
+    mask = data["regress"]
+    regression = (error * mask).sum() / mask.sum().clamp_min(1)
+    regression = regression + 0.12 * ((delta / model.bounds).square().mean(dim=-1) * ~mask).mean()
 
     # Binary cross-entropy learns per-candidate success. Listwise cross-entropy
     # places score mass on strong candidates across the full instruction list.
@@ -296,7 +291,7 @@ def _fit_calibration(model, logits, correct):
         return {"scale": float(scale), "bias": float(bias), "validation_bce": float(after)}
 
 
-def _fit(train, validation, device, seed, refine):
+def _fit(train, validation, device, seed):
     """Fit one head and restore the checkpoint with the lowest validation loss.
 
     训练一个预测头，并恢复验证损失最低时保存的权重。
@@ -304,7 +299,7 @@ def _fit(train, validation, device, seed, refine):
     x = _input(train["features"], train["boxes"])
     with torch.random.fork_rng(devices=[]):
         torch.random.default_generator.manual_seed(seed)
-        model = CandidateModel(train["features"].shape[-1], refine)
+        model = CandidateModel(train["features"].shape[-1])
     # Compute normalizer statistics from training proposals only.
     # 特征归一化的统计量只从训练候选计算。
     model.mean.copy_(x.mean(dim=(0, 1)))
@@ -346,31 +341,31 @@ def _fit(train, validation, device, seed, refine):
     return model, {"best_epoch": best_epoch, "epochs": epochs, "calibration": calibration}
 
 
-def train_learned(train, validation, device, seed=121):
-    """Return the ranking head, refinement head, and their validation histories.
+def train_refiner(train, validation, device, seed=121):
+    """Fit the refiner and return its weights and validation history.
 
-    Pass separate labeled candidate banks for training and validation. Both use
-    the same feature representation, with 24 proposals per instruction.
+    Use separate labeled sets for training and validation, each with
+    24 proposals per instruction.
 
-    返回排序头、细化头和各自的验证记录。
+    训练细化模型，并返回权重和验证记录。
 
-    分别传入独立的训练与验证候选库。两者使用相同的特征格式，每条指令提供 24 个候选。
+    分别使用带标签的训练集和验证集。每条指令提供 24 个候选。
     """
     train, validation = _prepare(train, True), _prepare(validation, True)
     if not len(train["boxes"]) or not len(validation["boxes"]) or not train["regress"].any():
         raise ValueError("Expected nonempty train and validation sets, with nearby targets in training")
     if train["features"].shape[-1] != validation["features"].shape[-1]:
         raise ValueError("Train and validation feature dimensions differ")
-    ranker, rank_history = _fit(train, validation, device, seed, refine=False)
-    refiner, refine_history = _fit(train, validation, device, seed + 1, refine=True)
-    return ranker, refiner, {"ranker": rank_history, "refiner": refine_history}
+    # Keep the seed offset from the reported run for the same initialization.
+    # 保留实验使用的随机种子偏移，使初始化与原实验一致。
+    return _fit(train, validation, device, seed + 1)
 
 
 @torch.inference_mode()
 def predict_learned(model, data, device):
-    """Return calibrated NumPy scores and optional residuals in proposal order.
+    """Return calibrated NumPy scores and pose corrections in proposal order.
 
-    按原候选顺序返回校准后的 NumPy 分数，以及细化头可选的位姿残差。
+    按原候选顺序返回校准后的 NumPy 分数和位姿修正量。
     """
     values = _prepare(data, False)
     model.to(device).eval()
@@ -380,10 +375,7 @@ def predict_learned(model, data, device):
         batch = _batch(values, slice(start, start + 256), device)
         logits, delta = model(batch["features"], batch["boxes"])
         scores.append((logits * model.calibration[0] + model.calibration[1]).cpu())
-        if delta is not None:
-            residuals.append(delta.cpu())
+        residuals.append(delta.cpu())
     logits = torch.cat(scores) if scores else values["boxes"].new_empty((0, 24))
-    if not model.refine:
-        return logits.numpy(), None
     delta = torch.cat(residuals) if residuals else values["boxes"].new_empty((0, 24, 5))
     return logits.numpy(), delta.numpy()

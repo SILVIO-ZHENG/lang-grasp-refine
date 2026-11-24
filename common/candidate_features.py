@@ -1,9 +1,9 @@
-"""Build features and annotation targets for the learned candidate heads.
+"""Build features and annotation targets for the refiner.
 
 Each candidate carries the appearance around its gripper footprint, geometry
 relative to the detected object, grounding scores, and its proposal rank.
 
-为学习式候选预测头构建输入特征与标注目标。
+为细化模型构建输入特征与标注目标。
 
 每个候选包含夹爪覆盖区域的外观、相对检测目标的几何信息、定位分数及初始名次。
 """
@@ -103,8 +103,8 @@ def feature_vector(boxes, regions, rgb):
     放大部位定位和初始候选名次四个分数组成。
     """
     obj, part, zoom, *_ = region_scores(boxes, regions)
-    # Center each appearance feature across the candidates for this instruction.
-    # 对这条指令下的同一外观特征，以所有候选的均值做中心化。
+    # Subtract each patch's mean RGB value from its 147 samples.
+    # 从每个候选的 147 个 RGB 采样值中减去该候选的采样均值。
     image_features = rgb - rgb.mean(axis=1, keepdims=True)
     best_object = np.zeros(5, dtype=np.float32)
     if len(regions['object_boxes']):
@@ -116,15 +116,3 @@ def feature_vector(boxes, regions, rgb):
     rank = np.log1p(np.arange(len(boxes), dtype=np.float32)) / np.log(1 + K)
     semantic = np.stack((obj, part, zoom, rank), axis=-1)
     return np.concatenate((image_features, object_relative, side_ratio, semantic), axis=-1).astype(np.float32)
-
-
-def agreement(first, second):
-    """For each first-list box, score its closest match in the second list.
-
-    用中心距离和角度差衡量两组候选的一致性，为第一组的每个候选返回最佳匹配分数。
-    """
-    if not len(second):
-        return np.zeros(len(first))
-    distance = np.linalg.norm(first[:, None, :2] - second[None, :, :2], axis=-1)
-    theta = angles(first[:, None, 4], second[None, :, 4])
-    return np.exp(-0.5 * (distance / 0.07) ** 2 - 0.5 * (theta / 0.46) ** 2).max(axis=1)

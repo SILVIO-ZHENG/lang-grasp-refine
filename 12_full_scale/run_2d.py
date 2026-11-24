@@ -1,8 +1,8 @@
-"""Fit candidate heads and evaluate the language-guided 2-D grasp variants."""
+"""Fit the geometry refiner and evaluate it against the grounded heatmap."""
 
-# The workflow fits the two candidate heads, evaluates the three methods on
-# test shards, and aggregates their results after validating every shard.
-# 按顺序训练两个候选头，在测试分片上评测三种方法，然后核验所有分片并汇总结果。
+# Train the refiner, evaluate the two methods on test shards, and validate
+# every shard before adding up the results.
+# 训练细化模型，在测试分片上评测两个方法，然后核验所有分片并汇总结果。
 
 import argparse
 from collections import Counter
@@ -10,9 +10,9 @@ import json
 import os
 from pathlib import Path
 
-from panels import detector_identity, load_panel_shard, manifest, positive, read_regions, sha256, shard_path
+from panels import load_panel_shard, manifest, positive, read_regions, sha256, shard_path
 from panels import TEST_GROUPS, write_json, write_lines
-from pipeline import (MODEL_NAMES, VARIANTS, ProposalBank, backbone_paths, batches, fitting_records, get_hits,
+from pipeline import (BACKBONE_ID, VARIANTS, ProposalBank, backbone_paths, batches, fitting_records, get_hits,
                       measure, metrics, score_order, select)
 
 import cv2
@@ -20,10 +20,10 @@ import numpy as np
 import torch
 
 from evaluate_seen_unseen import harmonic
-from learned import checkpoint_learned, train_learned
+from learned import checkpoint_learned, train_refiner
 
 
-HEAD_FILES = ('learned_ranking.pt', 'pose_refiner.pt')
+REFINER_FILE = 'pose_refiner.pt'
 SELECTION = 'validation_selection.json'
 VERSION = 1
 
@@ -38,53 +38,53 @@ def checkpoints(root, tag):
     # Fingerprint source, weights, and vocabulary separately because each can
     # affect the candidate pool produced by a checkpoint.
     # 分别记录模型源码、权重和词表的指纹，三者都可能改变检查点生成的候选池。
-    fingerprints = {}
-    for method in MODEL_NAMES:
-        source, run = backbone_paths(root, method, tag)
-        fingerprints[method] = {
+    source, run = backbone_paths(root, tag)
+    return {
+        BACKBONE_ID: {
             'model.py': sha256(source),
             f'{tag}/best.pt': sha256(run / 'best.pt'),
             f'{tag}/vocabulary.json': sha256(run / 'vocabulary.json'),
         }
-    return fingerprints
+    }
 
 
 def load_fit(folder, root=None, tag=None, panel_digest=None):
-    # Validate the fitted heads and their recorded inputs before reuse.
-    # Callers that load backbone weights also verify the backbone hashes.
-    # 复用候选头前，先校验权重及其记录的输入。需要加载主模型时还会核验主模型指纹。
+    # Verify the refiner and its inputs. Legacy receipts may carry extra
+    # settings, but their original file digest still identifies past shards.
+    # 校验细化模型及其输入。旧版完成记录可能包含额外配置，其原始文件指纹仍用于核验历史分片。
     path = folder / SELECTION
     config = read_json(path)
     if config['version'] != VERSION or (panel_digest is not None and config['panel_sha256'] != panel_digest):
         raise ValueError(f'Head training was completed for a different panel: {path}')
-    if root is not None and checkpoints(root, tag) != config['backbones']:
-        raise ValueError(f'Backbone model files differ from the head training configuration: {path}')
-    if any(sha256(folder / name) != digest for name, digest in config['heads'].items()):
-        raise ValueError(f'Learned head weights changed: {path}')
+    if root is not None and checkpoints(root, tag)[BACKBONE_ID] != config['backbones'].get(BACKBONE_ID):
+        raise ValueError(f'Heatmap model files differ from the refiner training configuration: {path}')
+    if sha256(folder / REFINER_FILE) != config['heads'].get(REFINER_FILE):
+        raise ValueError(f'Refiner weights changed: {path}')
+    config['selection'] = {name: config['selection'][name] for name in VARIANTS}
     return config, sha256(path)
 
 
 def _load_head_panel(args, bank, data, digest, group, detector):
     # Concatenate supervised records along the instruction axis. The
-    # validation-only contact boxes, regions, and labels keep that same order.
-    # 沿指令轴合并监督样本。验证专用的接触点候选、定位区域和标注保持同样的顺序。
+    # validation regions and labels keep that same order.
+    # 沿指令轴合并监督样本。验证集的定位区域和标注保持同样的顺序。
     pieces = []
-    aux, regions, truths = [], [], []
+    regions, truths = [], []
     for values, extra, detector in fitting_records(args, bank, data, digest, group, detector):
         pieces.append(values)
         if extra is not None:
-            aux.append(extra[0])
-            regions.extend(extra[1])
-            truths.extend(extra[2])
+            extra_regions, extra_truths = extra
+            regions.extend(extra_regions)
+            truths.extend(extra_truths)
     combined = {key: np.concatenate([part[key] for part in pieces], axis=0) for key in pieces[0]}
-    return combined, (np.concatenate(aux), regions, truths) if aux else None, detector
+    return combined, (regions, truths), detector
 
 
 def fit(args):
     # A finished fit can be reused when the panel, checkpoints, and seed agree.
-    # The validation receipt is written after the checkpoints and history.
+    # The validation receipt is written after the checkpoint and history.
     # 数据清单、检查点和随机种子一致时，可复用已完成的训练。
-    # 验证配置在候选头权重和训练历史写好后才落盘。
+    # 验证配置在细化模型权重和训练历史写好后才落盘。
     data, digest = manifest(args.panels)
     if (args.output / SELECTION).is_file():
         previous, _ = load_fit(args.output, args.root, args.tag, digest)
@@ -95,27 +95,26 @@ def fit(args):
     args.output.mkdir(parents=True, exist_ok=True)
     base_sha = checkpoints(args.root, args.tag)
     bank = ProposalBank(args.root, args.tag, args.device)
-    # Training supplies the head supervision. Validation selects head
-    # checkpoints, calibrates scores, and chooses the final scoring weights.
-    # 训练集提供候选头监督。验证集用来选择检查点、校准分数和选择最终评分权重。
+    # Use training labels to fit the refiner and validation labels to select
+    # its checkpoint, calibrate its scores, and choose final scoring weights.
+    # 使用训练标签学习细化模型，用验证标签选择检查点、校准分数和选择最终评分权重。
     train_set, _, detector = _load_head_panel(args, bank, data, digest, 'train', None)
     validation, info, detector = _load_head_panel(args, bank, data, digest, 'val', detector)
-    bank.ranker, bank.refiner, history = train_learned(train_set, validation, args.device, seed=args.seed)
+    bank.refiner, history = train_refiner(train_set, validation, args.device, seed=args.seed)
     report = select(bank, validation, *info)
     if checkpoints(args.root, args.tag) != base_sha:
         raise ValueError('Backbone files changed during head training')
-    # Stage each checkpoint first so an interrupted write cannot replace a
+    # Stage the checkpoint first so an interrupted write cannot replace a
     # usable file with a partial checkpoint.
     # 先写入临时文件，避免保存中断时用不完整权重替换可用的检查点。
-    for name, head in zip(HEAD_FILES, (bank.ranker, bank.refiner), strict=True):
-        path = args.output / name
-        stage = path.with_name(f'.{path.name}.{os.getpid()}.tmp')
-        torch.save(checkpoint_learned(head), stage)
-        stage.replace(path)
-    write_json(args.output / 'learner_history.json', history)
+    path = args.output / REFINER_FILE
+    stage = path.with_name(f'.{path.name}.{os.getpid()}.tmp')
+    torch.save(checkpoint_learned(bank.refiner), stage)
+    stage.replace(path)
+    write_json(args.output / 'learner_history.json', {'refiner': history})
     result = {'version': VERSION, 'panel_sha256': digest, 'detector': detector,
-              'backbones': base_sha, 'backbone_epochs': dict(zip(MODEL_NAMES, (bank.base[3], bank.aux[3]))),
-              'heads': {name: sha256(args.output / name) for name in HEAD_FILES}, 'seed': args.seed,
+              'backbones': base_sha, 'backbone_epochs': {BACKBONE_ID: bank.base[3]},
+              'heads': {REFINER_FILE: sha256(path)}, 'seed': args.seed,
               'refiner_head_train_rows': len(train_set['boxes']), 'selection_val_rows': len(validation['boxes']),
               'selection': report}
     write_json(args.output / SELECTION, result)
@@ -123,32 +122,24 @@ def fit(args):
 
 
 def _evaluation_signature(panel_digest, fit_digest):
-    # Bind result shards to the exact panel and fitted-head configuration.
-    # 将评测分片绑定到对应的数据清单和候选头训练配置。
+    # Bind result shards to the exact panel and refiner configuration.
+    # 将评测分片绑定到对应的数据清单和细化模型训练配置。
     return {'version': VERSION, 'panel_sha256': panel_digest, 'fit_sha256': fit_digest}
 
 
 def _eval_rows(args, bank, rows, detections, totals):
-    # Compare all three methods on the same instruction and annotations.
+    # Compare the baseline and refinement on the same instruction and labels.
     # Test annotations are used to measure already-scored proposals.
-    # 在同一条指令和同一组标注上比较三种方法。
+    # 在同一条指令和同一组标注上比较基线与细化方法。
     # 测试标注只用于评测已完成打分的候选。
     for images, source, prompts, regions, truths in batches(args, rows, detections):
         stream = bank.results(images, prompts, regions)
         for row, truth, result in zip(source, truths, stream, strict=True):
-            raw, base_score, refined, refine_score, combo, scores = result
-            raw_hits = get_hits(raw, truth)
-            refined_hits = get_hits(refined, truth)
-            # The combined pool begins with the refined boxes, so only the
-            # appended contact boxes require additional ground-truth matching.
-            # 合并候选池以细化后的热图框开头，因此只需对附加的接触点候选再匹配标注。
-            combo_hits = np.concatenate((refined_hits, get_hits(combo[len(refined):], truth)))
-            groups = [(raw, raw_hits, score_order(base_score), False),
-                      (refined, refined_hits, score_order(refine_score), False),
-                      (combo, combo_hits, score_order(scores), True)]
+            raw, base_score, refined, refine_score = result
+            groups = ((raw, base_score), (refined, refine_score))
             predictions = {}
-            for name, (boxes, hits, order, distinct) in zip(VARIANTS, groups, strict=True):
-                top1, top5, oracle, top = measure(boxes, hits, order, distinct)
+            for name, (boxes, scores) in zip(VARIANTS, groups, strict=True):
+                top1, top5, oracle, top = measure(get_hits(boxes, truth), score_order(scores))
                 totals[name].update(top1_successes=top1, top5_successes=top5, oracle_successes=oracle)
                 predictions[name] = {'success': bool(top1), 'prediction': boxes[top].tolist()}
             # Keep one reference box for inspection. The metrics above compare
